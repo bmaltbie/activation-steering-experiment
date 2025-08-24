@@ -1,11 +1,10 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
+#!/usr/bin/env python3
+"""
+Main entry point for the Activation Steering Experiment.
+This imports and runs the comprehensive implementation.
+"""
 
-model_name = "Qwen/Qwen3-8B" # https://huggingface.co/Qwen/Qwen3-8B
+from activation_steering import main
 
-# load the tokenizer and the model
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype="auto",
-    device_map="auto"
-)
+if __name__ == "__main__":
+    main()
