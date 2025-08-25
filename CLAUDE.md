@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an AI safety research project implementing activation steering for toxicity reduction in the Qwen3-8B model. The project uses contrastive activation addition (CAA) to compute steering vectors that can reduce toxic outputs while preserving model capability on benign prompts.
+This is an AI safety research project implementing activation steering for toxicity reduction in the Phi-4-mini-instruct model. The project uses contrastive activation addition (CAA) to compute steering vectors that can reduce toxic outputs while preserving model capability on benign prompts.
 
 ## Development Environment
 
 - **Python Version**: 3.13.1
 - **Virtual Environment**: Located in `.venv/` directory
-- **Key Dependencies**: transformers, torch, datasets, tqdm, numpy
+- **Key Dependencies**: transformers, torch, datasets, tqdm, numpy, matplotlib, seaborn
 
 ## Common Commands
 
@@ -20,8 +20,29 @@ This is an AI safety research project implementing activation steering for toxic
 source .venv/bin/activate
 
 # Install required dependencies (already installed)
-pip install datasets torch tqdm transformers
+pip install datasets torch tqdm transformers matplotlib seaborn
+
+# For Apple Silicon users - ensure MPS support
+python -c "import torch; print('MPS available:', torch.backends.mps.is_available())"
 ```
+
+### Apple Silicon Optimization
+For optimal performance on Apple Silicon (M1/M2/M3) Macs:
+
+```bash
+# Set environment variables for better memory management
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
+
+# Verify MPS acceleration is working
+python -c "import torch; print('Device:', torch.device('mps') if torch.backends.mps.is_available() else 'cpu')"
+```
+
+**Apple Silicon Notes:**
+- The code automatically detects and uses MPS acceleration when available
+- Memory optimizations are applied specifically for unified memory architecture
+- Falls back gracefully to CPU if MPS encounters issues
+- FP16 precision is enabled by default on MPS for better performance
+- Phi-4-mini-instruct is significantly smaller and more memory efficient than larger models
 
 ### Running the Experiment
 ```bash
@@ -41,7 +62,8 @@ source .venv/bin/activate && python activation_steering.py
 source .venv/bin/activate && pip list
 
 # Monitor GPU usage during experiments
-nvidia-smi -l 1  # if using GPU
+nvidia-smi -l 1  # if using NVIDIA GPU
+sudo powermetrics -s gpu_power -n 1 --samplers gpu_power  # if using Apple Silicon
 ```
 
 ## Code Architecture
@@ -68,11 +90,11 @@ The project implements a comprehensive activation steering pipeline:
 
 ## Key Technical Details
 
-- **Model**: Qwen/Qwen3-8B (8-billion parameter causal language model)
+- **Model**: microsoft/Phi-4-mini-instruct (compact, efficient language model optimized for instruction following)
 - **Toxicity Scorer**: unitary/unbiased-toxic-roberta for MeanToxicity evaluation
 - **Activation Capture**: Forward hooks on transformer layers with mean-pooling over last 32 tokens
 - **Steering Method**: Contrastive activation addition applied during inference
-- **Hardware**: Optimized for GPU use with automatic fallback to CPU
+- **Hardware**: Optimized for GPU use (CUDA/Apple Silicon MPS) with automatic fallback to CPU
 
 ## Project Structure
 
@@ -89,14 +111,22 @@ The project implements a comprehensive activation steering pipeline:
 
 ## Results and Output
 
+### Data Files
 - **experiment_results.json**: Complete experimental results with baseline and steering data
+- **intermediate_experiment_output.json**: Step-by-step progress logging with detailed metrics
 - **partial_experiment_results.json**: Saved if experiment is interrupted
 - **failed_experiment_results.json**: Saved if experiment fails mid-execution
+
+### Visualization Output
+- **plots/**: Directory containing all generated visualization files
+  - **alpha_sweep_results.png/pdf**: Main analysis showing toxicity across alpha values
+  - **toxicity_heatmaps.png/pdf**: Detailed heatmap analysis of all results
+  - **summary_statistics.png/pdf**: Statistical summary and distribution analysis
 
 ## Notes for Development
 
 - Always activate virtual environment before running any Python commands
-- The model requires significant computational resources (8B parameters)
+- The Phi-4-mini-instruct model is much more memory efficient than larger models
 - GPU usage is recommended but CPU fallback is implemented
 - Results are automatically saved with comprehensive metrics
 - The experiment implements proper error handling and partial result saving

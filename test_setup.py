@@ -14,7 +14,7 @@ def test_basic_setup():
     
     try:
         # Test model and tokenizer loading
-        model_name = "Qwen/Qwen3-8B"
+        model_name = "microsoft/Phi-4-mini-instruct"
         print(f"Loading {model_name}...")
         
         tokenizer = AutoTokenizer.from_pretrained(model_name)
