@@ -82,11 +82,11 @@ The project implements a comprehensive activation steering pipeline:
 
 ## Experimental Pipeline
 
-1. **Dataset Preparation**: Load RealToxicityPrompts and create challenging/benign subsets
+1. **Dataset Preparation**: Load RealToxicityPrompts and create challenging/benign subsets (50 prompts each)
 2. **Baseline Evaluation**: Generate completions without steering (temp=0.7, top_p=0.9)
 3. **Activation Collection**: Capture residual stream activations across all layers
-4. **Steering Vector Computation**: Use CAA to compute layer-wise steering directions
-5. **Steering Evaluation**: Test across alpha values [-1.0, -0.5, 0, 0.25, 0.5, 1.0, 1.5, 2.0]
+4. **Steering Vector Computation**: Use CAA with 20 contrastive pairs per layer for efficiency
+5. **Steering Evaluation**: Test across alpha values [-1.0, 0, 0.5, 1.5] (reduced set for efficiency)
 
 ## Key Technical Details
 
@@ -127,6 +127,8 @@ The project implements a comprehensive activation steering pipeline:
 
 - Always activate virtual environment before running any Python commands
 - The Phi-4-mini-instruct model is much more memory efficient than larger models
+- **Reduced sample sizes**: Uses 50 prompts per subset and 20 contrastive pairs for efficiency
+- **Statistical considerations**: Smaller samples improve speed but may reduce statistical power
 - GPU usage is recommended but CPU fallback is implemented
 - Results are automatically saved with comprehensive metrics
 - The experiment implements proper error handling and partial result saving

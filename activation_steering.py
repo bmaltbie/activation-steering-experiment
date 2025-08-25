@@ -47,13 +47,13 @@ class GenerationConfig:
 @dataclass
 class SteeringConfig:
     """Configuration for activation steering"""
-    k_examples: int = 50  # Number of top-K toxic/non-toxic examples
+    k_examples: int = 20  # Number of top-K toxic/non-toxic examples (reduced for efficiency)
     mean_pool_tokens: int = 32  # Number of last tokens to mean-pool
     alpha_values: List[float] = None  # Alpha values for steering strength
     
     def __post_init__(self):
         if self.alpha_values is None:
-            self.alpha_values = [-1.0, -0.5, 0, 0.25, 0.5, 1.0, 1.5, 2.0]
+            self.alpha_values = [-1.0, 0, 0.5, 1.5]  # Reduced set for efficiency
 
 class ActivationSteeringExperiment:
     """
@@ -210,9 +210,9 @@ class ActivationSteeringExperiment:
             reverse=True
         )
         
-        # Create subsets
-        self.challenging_subset = sorted_prompts[:100]  # Top 100 most toxic
-        self.benign_subset = sorted_prompts[-100:]      # Bottom 100 least toxic
+        # Create subsets (reduced size for efficiency)
+        self.challenging_subset = sorted_prompts[:50]   # Top 50 most toxic
+        self.benign_subset = sorted_prompts[-50:]       # Bottom 50 least toxic
         
         print(f"Created challenging subset: {len(self.challenging_subset)} prompts")
         print(f"Mean toxicity: {np.mean([p['prompt']['toxicity'] for p in self.challenging_subset]):.3f}")
@@ -544,6 +544,8 @@ class ActivationSteeringExperiment:
             raise ValueError("Activations not collected. Run collect_activations() first.")
         
         print("Computing steering vectors using contrastive activation addition...")
+        print(f"Note: Using k={self.steering_config.k_examples} contrastive pairs per layer.")
+        print("Reduced sample size may affect statistical robustness but improves computational efficiency.")
         
         steering_vectors = {}
         
@@ -563,6 +565,12 @@ class ActivationSteeringExperiment:
             
             # Select top-K toxic and top-K non-toxic examples
             k = self.steering_config.k_examples
+            
+            # Check if we have enough data
+            if len(sorted_data) < 2 * k:
+                print(f"  Warning: Layer {layer_idx} has only {len(sorted_data)} samples, need {2*k}. Using all available data.")
+                k = min(k, len(sorted_data) // 2)
+                
             toxic_examples = sorted_data[:k]  # Most toxic
             non_toxic_examples = sorted_data[-k:]  # Least toxic
             
@@ -1005,6 +1013,11 @@ class ActivationSteeringExperiment:
         print(f"  - alpha_sweep_results.png/pdf: Main alpha sweep analysis")
         print(f"  - toxicity_heatmaps.png/pdf: Detailed heatmap analysis")
         print(f"  - summary_statistics.png/pdf: Statistical summary")
+        
+        print(f"\n=== Statistical Notes ===")
+        print(f"Experiment used {self.steering_config.k_examples} contrastive pairs and {len(challenging_scores)} alpha values: {self.steering_config.alpha_values}.")
+        print(f"Reduced sample sizes improve efficiency but may affect statistical power.")
+        print(f"Results should be interpreted with appropriate caution for the sample size.")
         
         if baseline_challenging > 0:
             best_alpha = alpha_values[np.argmin(challenging_scores)]
