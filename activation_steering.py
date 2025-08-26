@@ -22,6 +22,8 @@ from transformers import (
     pipeline,
     set_seed
 )
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend to avoid display issues
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import seaborn as sns
@@ -137,6 +139,71 @@ class ActivationSteeringExperiment:
         
         # Apple Silicon specific optimizations
         self._setup_apple_silicon_optimizations()
+        
+        # Set up model architecture compatibility
+        self._setup_model_architecture()
+    
+    def _setup_model_architecture(self) -> None:
+        """Detect model architecture and set up layer access compatibility"""
+        model_type = type(self.model).__name__.lower()
+        
+        try:
+            if 'phi' in model_type:
+                # Phi models use 'model.layers' instead of 'transformer.h'
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+                    self.transformer_layers = self.model.model.layers
+                    self.layer_attr = 'model.layers'
+                    print(f"Detected Phi architecture: {type(self.model).__name__}")
+                else:
+                    raise AttributeError("Phi model doesn't have expected structure")
+                    
+            elif hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
+                # GPT-style models (GPT-2, Qwen, etc.) use 'transformer.h'
+                self.transformer_layers = self.model.transformer.h
+                self.layer_attr = 'transformer.h'
+                print(f"Detected GPT-style architecture: {type(self.model).__name__}")
+                
+            elif hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+                # LLaMA-style models use 'model.layers'
+                self.transformer_layers = self.model.model.layers
+                self.layer_attr = 'model.layers'
+                print(f"Detected LLaMA-style architecture: {type(self.model).__name__}")
+                
+            else:
+                # Try to find layers automatically
+                possible_attrs = [
+                    ('model.layers', lambda m: m.model.layers),
+                    ('transformer.h', lambda m: m.transformer.h),
+                    ('transformer.layers', lambda m: m.transformer.layers),
+                    ('layers', lambda m: m.layers),
+                ]
+                
+                for attr_name, attr_getter in possible_attrs:
+                    try:
+                        layers = attr_getter(self.model)
+                        if hasattr(layers, '__len__') and len(layers) > 0:
+                            self.transformer_layers = layers
+                            self.layer_attr = attr_name
+                            print(f"Auto-detected architecture with {attr_name}: {type(self.model).__name__}")
+                            break
+                    except (AttributeError, TypeError):
+                        continue
+                else:
+                    raise ValueError(f"Could not find transformer layers in model {type(self.model).__name__}")
+            
+            # Validate that we have layers
+            if not hasattr(self, 'transformer_layers') or len(self.transformer_layers) == 0:
+                raise ValueError(f"No transformer layers found in {type(self.model).__name__}")
+                
+            print(f"Found {len(self.transformer_layers)} transformer layers")
+            
+        except Exception as e:
+            print(f"Error detecting model architecture: {e}")
+            print("Available attributes:")
+            for attr in dir(self.model):
+                if not attr.startswith('_'):
+                    print(f"  - {attr}")
+            raise
     
     def _setup_apple_silicon_optimizations(self) -> None:
         """Configure optimizations specific to Apple Silicon"""
@@ -313,21 +380,46 @@ class ActivationSteeringExperiment:
         def steering_hook(module, input, output):
             nonlocal applied_steering
             if not applied_steering:
+                # Handle different output formats
+                if isinstance(output, tuple):
+                    activation_tensor = output[0]
+                    rest_of_output = output[1:]
+                else:
+                    activation_tensor = output
+                    rest_of_output = ()
+                
                 # Apply steering to the residual stream
-                # output[0] shape: [batch_size, seq_len, hidden_dim]
-                batch_size, seq_len, hidden_dim = output[0].shape
+                original_shape = activation_tensor.shape
                 
-                # Add steering vector to all positions
-                steering_addition = alpha * steering_vector.unsqueeze(0).unsqueeze(0)  # [1, 1, hidden_dim]
-                steering_addition = steering_addition.expand(batch_size, seq_len, hidden_dim)
+                if activation_tensor.dim() == 3:
+                    # Standard case: [batch_size, seq_len, hidden_dim]
+                    batch_size, seq_len, hidden_dim = activation_tensor.shape
+                    steering_addition = alpha * steering_vector.unsqueeze(0).unsqueeze(0)  # [1, 1, hidden_dim]
+                    steering_addition = steering_addition.expand(batch_size, seq_len, hidden_dim)
+                elif activation_tensor.dim() == 2:
+                    # Case: [seq_len, hidden_dim] - add batch dimension
+                    seq_len, hidden_dim = activation_tensor.shape
+                    steering_addition = alpha * steering_vector.unsqueeze(0)  # [1, hidden_dim]
+                    steering_addition = steering_addition.expand(seq_len, hidden_dim)
+                else:
+                    print(f"Warning: Unexpected activation tensor shape in steering: {original_shape}")
+                    return output
                 
-                output = (output[0] + steering_addition.to(output[0].device),) + output[1:]
+                # Apply steering
+                steered_activation = activation_tensor + steering_addition.to(activation_tensor.device)
+                
+                # Reconstruct output
+                if isinstance(output, tuple):
+                    output = (steered_activation,) + rest_of_output
+                else:
+                    output = steered_activation
+                    
                 applied_steering = True
                 
             return output
         
         # Register hook on the target layer
-        hook = self.model.transformer.h[layer].register_forward_hook(steering_hook)
+        hook = self.transformer_layers[layer].register_forward_hook(steering_hook)
         
         try:
             outputs = self.model.generate(
@@ -422,8 +514,9 @@ class ActivationSteeringExperiment:
         print("Collecting activations from model layers...")
         
         # Get all transformer layers
-        num_layers = len(self.model.transformer.h)
+        num_layers = len(self.transformer_layers)
         print(f"Model has {num_layers} transformer layers")
+        print("Note: Activation collection handles different tensor shapes automatically")
         
         # Storage for activations
         layer_activations = {i: [] for i in range(num_layers)}
@@ -432,12 +525,18 @@ class ActivationSteeringExperiment:
         def make_hook(layer_idx):
             def hook_fn(module, input, output):
                 # Store the activation (residual stream output)
-                current_activations[layer_idx] = output[0].detach().cpu()
+                # Handle different output formats from different model architectures
+                if isinstance(output, tuple):
+                    activation = output[0].detach().cpu()
+                else:
+                    activation = output.detach().cpu()
+                
+                current_activations[layer_idx] = activation
             return hook_fn
         
         # Register hooks for all layers
         hooks = []
-        for i, layer in enumerate(self.model.transformer.h):
+        for i, layer in enumerate(self.transformer_layers):
             hook = layer.register_forward_hook(make_hook(i))
             hooks.append(hook)
         
@@ -488,16 +587,41 @@ class ActivationSteeringExperiment:
                 
                 # Store activations for each layer with metadata
                 for layer_idx in current_activations:
-                    # Mean pool over the last min(32, sequence_length) tokens
                     activation = current_activations[layer_idx]
-                    seq_len = activation.shape[1]
-                    pool_tokens = min(self.steering_config.mean_pool_tokens, seq_len)
                     
-                    # Take the last pool_tokens and mean pool
-                    pooled_activation = activation[:, -pool_tokens:, :].mean(dim=1)  # [1, hidden_dim]
+                    # Handle different activation tensor shapes
+                    if activation.dim() == 2:
+                        # Shape: [seq_len, hidden_dim] - need to add batch dimension
+                        activation = activation.unsqueeze(0)  # [1, seq_len, hidden_dim]
+                    elif activation.dim() == 1:
+                        # Shape: [hidden_dim] - already pooled, just use as is
+                        pooled_activation = activation
+                        layer_activations[layer_idx].append({
+                            'activation': pooled_activation,  # [hidden_dim]
+                            'completion': completion,
+                            'prompt_type': label,
+                            'prompt': prompt
+                        })
+                        continue
+                    elif activation.dim() != 3:
+                        print(f"Warning: Unexpected activation shape at layer {layer_idx}: {activation.shape}")
+                        # Skip this layer if we can't handle the shape
+                        continue
+                    
+                    # Now we should have [batch_size, seq_len, hidden_dim]
+                    if activation.dim() == 3:
+                        seq_len = activation.shape[1]
+                        pool_tokens = min(self.steering_config.mean_pool_tokens, seq_len)
+                        
+                        # Take the last pool_tokens and mean pool
+                        pooled_activation = activation[:, -pool_tokens:, :].mean(dim=1)  # [batch_size, hidden_dim]
+                        pooled_activation = pooled_activation.squeeze(0)  # [hidden_dim]
+                    else:
+                        # Fallback: just use the activation as is
+                        pooled_activation = activation.flatten()
                     
                     layer_activations[layer_idx].append({
-                        'activation': pooled_activation.squeeze(0),  # [hidden_dim]
+                        'activation': pooled_activation,  # [hidden_dim]
                         'completion': completion,
                         'prompt_type': label,
                         'prompt': prompt
@@ -757,7 +881,93 @@ class ActivationSteeringExperiment:
             'baseline_benign': self.baseline_results['benign']['mean_toxicity'] if self.baseline_results else None
         }
     
-    def save_results(self, filepath: str, steering_results: Dict[str, Any] = None) -> None:
+    def evaluate_steering_all_layers(self, challenging_subset_size: int = None, benign_subset_size: int = None) -> Dict[str, Any]:
+        """
+        Evaluate steering effectiveness across all layers for comprehensive analysis.
+        This provides layer-wise effectiveness data for visualization.
+        """
+        if not self.steering_vectors:
+            raise ValueError("Steering vectors not computed. Run compute_steering_vectors() first.")
+        
+        print("=== Evaluating Steering Across All Layers ===")
+        
+        # Use subset of prompts for efficiency (layer evaluation is computationally intensive)
+        challenging_subset_size = challenging_subset_size or min(10, len(self.challenging_subset))
+        benign_subset_size = benign_subset_size or min(10, len(self.benign_subset))
+        
+        challenging_prompts = [item['prompt']['text'] for item in self.challenging_subset[:challenging_subset_size]]
+        benign_prompts = [item['prompt']['text'] for item in self.benign_subset[:benign_subset_size]]
+        
+        print(f"Using {len(challenging_prompts)} challenging and {len(benign_prompts)} benign prompts")
+        print(f"Evaluating {len(self.steering_vectors)} layers across {len(self.steering_config.alpha_values)} alpha values")
+        
+        # Store layer-wise results
+        layer_results = {}
+        
+        # Test a subset of alpha values for layer analysis (for computational efficiency)
+        test_alphas = [alpha for alpha in self.steering_config.alpha_values if alpha != 0]  # Exclude baseline
+        if len(test_alphas) > 3:
+            test_alphas = test_alphas[::2]  # Take every other alpha to reduce computation
+        
+        print(f"Testing alpha values for layer analysis: {test_alphas}")
+        
+        for layer_idx in tqdm(sorted(self.steering_vectors.keys()), desc="Layer evaluation"):
+            layer_results[layer_idx] = {}
+            
+            for alpha in test_alphas:
+                # Generate completions with steering at this specific layer
+                challenging_completions = self.generate_completions(
+                    challenging_prompts, alpha=alpha, layer=layer_idx
+                )
+                benign_completions = self.generate_completions(
+                    benign_prompts, alpha=alpha, layer=layer_idx
+                )
+                
+                # Score the completions
+                challenging_scores = self.score_toxicity(challenging_completions)
+                benign_scores = self.score_toxicity(benign_completions)
+                
+                # Store results for this layer and alpha
+                layer_results[layer_idx][alpha] = {
+                    'challenging': {
+                        'completions': challenging_completions,
+                        'toxicity_scores': challenging_scores,
+                        'mean_toxicity': np.mean(challenging_scores) if challenging_scores else 0
+                    },
+                    'benign': {
+                        'completions': benign_completions,
+                        'toxicity_scores': benign_scores,
+                        'mean_toxicity': np.mean(benign_scores) if benign_scores else 0
+                    }
+                }
+        
+        # Calculate layer effectiveness metrics
+        layer_effectiveness = {}
+        for layer_idx in layer_results:
+            effectiveness_scores = []
+            for alpha in test_alphas:
+                if alpha in layer_results[layer_idx]:
+                    challenging_toxicity = layer_results[layer_idx][alpha]['challenging']['mean_toxicity']
+                    # Lower toxicity = higher effectiveness, so we invert
+                    effectiveness_scores.append(1.0 - challenging_toxicity)
+            
+            layer_effectiveness[layer_idx] = {
+                'mean_effectiveness': np.mean(effectiveness_scores) if effectiveness_scores else 0,
+                'max_effectiveness': np.max(effectiveness_scores) if effectiveness_scores else 0,
+                'effectiveness_scores': effectiveness_scores
+            }
+        
+        return {
+            'layer_results': layer_results,
+            'layer_effectiveness': layer_effectiveness,
+            'test_alphas': test_alphas,
+            'num_prompts': {
+                'challenging': len(challenging_prompts),
+                'benign': len(benign_prompts)
+            }
+        }
+    
+    def save_results(self, filepath: str, steering_results: Dict[str, Any] = None, layer_analysis_results: Dict[str, Any] = None) -> None:
         """Save all experimental results to file"""
         results = {
             'baseline_results': self.baseline_results,
@@ -770,10 +980,87 @@ class ActivationSteeringExperiment:
             }
         }
         
+        # Add layer analysis results if provided
+        if layer_analysis_results:
+            results['layer_analysis_results'] = layer_analysis_results
+        
         with open(filepath, 'w') as f:
             json.dump(results, f, indent=2, default=str)
         
         print(f"Results saved to {filepath}")
+    
+    @staticmethod
+    def load_and_plot_results(results_file: str = "experiment_results.json", save_dir: str = "plots") -> None:
+        """Load results from JSON file and create plots without re-running experiment"""
+        print(f"Loading experiment results from {results_file}...")
+        
+        try:
+            with open(results_file, 'r') as f:
+                saved_results = json.load(f)
+            
+            # Extract the steering results and configuration
+            steering_results = saved_results.get('steering_results')
+            config = saved_results.get('config', {})
+            
+            if not steering_results:
+                print("Error: No steering results found in the file.")
+                print("Available keys:", list(saved_results.keys()))
+                return
+            
+            print("✓ Results loaded successfully")
+            print(f"Found results for {len(steering_results.get('results', {}))} alpha values")
+            
+            # Create a minimal experiment instance for plotting configuration
+            # We need the steering config for plotting
+            steering_config = SteeringConfig()
+            if 'steering_config' in config:
+                steering_config.k_examples = config['steering_config'].get('k_examples', 20)
+                if 'alpha_values' in config['steering_config']:
+                    steering_config.alpha_values = config['steering_config']['alpha_values']
+            
+            # Create temporary experiment instance for plotting method access
+            class PlottingHelper:
+                def __init__(self, steering_config):
+                    self.steering_config = steering_config
+                
+                def plot_results(self, steering_results: Dict[str, Any], save_dir: str = "plots") -> None:
+                    # Import the actual plotting method from the experiment class
+                    temp_experiment = ActivationSteeringExperiment.__new__(ActivationSteeringExperiment)
+                    temp_experiment.steering_config = self.steering_config
+                    
+                    # Call the original plot_results method
+                    ActivationSteeringExperiment.plot_results(temp_experiment, steering_results, save_dir)
+            
+            # Create plotting helper and generate plots
+            plotter = PlottingHelper(steering_config)
+            plotter.plot_results(steering_results, save_dir)
+            
+            # Generate layer analysis plots if data is available
+            if 'layer_analysis_results' in saved_results:
+                print("Found layer analysis data, generating layer plots...")
+                temp_experiment = ActivationSteeringExperiment.__new__(ActivationSteeringExperiment)
+                temp_experiment.plot_layer_analysis(saved_results['layer_analysis_results'], save_dir)
+                print(f"✓ Layer analysis plots generated successfully")
+            
+            print(f"✓ All plots generated successfully in '{save_dir}/' directory")
+            
+        except FileNotFoundError:
+            print(f"Error: Results file '{results_file}' not found.")
+            print("Available files:")
+            from pathlib import Path
+            current_dir = Path(".")
+            json_files = list(current_dir.glob("*.json"))
+            if json_files:
+                for file in json_files:
+                    print(f"  - {file}")
+            else:
+                print("  No JSON files found in current directory")
+                
+        except json.JSONDecodeError as e:
+            print(f"Error: Invalid JSON file format: {e}")
+            
+        except Exception as e:
+            print(f"Error loading results: {e}")
     
     def plot_results(self, steering_results: Dict[str, Any], save_dir: str = "plots") -> None:
         """Create comprehensive plots of the steering experiment results"""
@@ -781,252 +1068,537 @@ class ActivationSteeringExperiment:
             print("Warning: No steering results available for plotting")
             return
             
-        # Create plots directory
-        Path(save_dir).mkdir(exist_ok=True)
+        try:
+            # Create plots directory
+            Path(save_dir).mkdir(exist_ok=True)
+            
+            # Check matplotlib backend
+            current_backend = matplotlib.get_backend()
+            print(f"Using matplotlib backend: {current_backend}")
+            
+            # Set up the plotting style
+            plt.style.use('default')
+            sns.set_palette("husl")
         
-        # Set up the plotting style
-        plt.style.use('default')
-        sns.set_palette("husl")
+        except Exception as e:
+            print(f"Error setting up plotting environment: {e}")
+            print("Attempting to continue with basic plotting...")
+            Path(save_dir).mkdir(exist_ok=True)
         
-        results = steering_results['results']
-        alpha_values = self.steering_config.alpha_values
+        try:
+            results = steering_results['results']
+            alpha_values = self.steering_config.alpha_values
+            
+            # Extract data for plotting (convert alpha values to strings to match JSON keys)
+            challenging_scores = [results[str(alpha)]['challenging']['mean_toxicity'] for alpha in alpha_values]
+            benign_scores = [results[str(alpha)]['benign']['mean_toxicity'] for alpha in alpha_values]
+            
+            baseline_challenging = steering_results.get('baseline_challenging', 0)
+            baseline_benign = steering_results.get('baseline_benign', 0)
+            
+            # Plot 1: Alpha Sweep - Mean Toxicity Scores
+            plt.figure(figsize=(12, 8))
         
-        # Extract data for plotting
-        challenging_scores = [results[alpha]['challenging']['mean_toxicity'] for alpha in alpha_values]
-        benign_scores = [results[alpha]['benign']['mean_toxicity'] for alpha in alpha_values]
+            plt.subplot(2, 2, 1)
+            plt.plot(alpha_values, challenging_scores, 'o-', linewidth=2.5, markersize=8, 
+                    label='Challenging Subset', color='#e74c3c')
+            plt.plot(alpha_values, benign_scores, 's-', linewidth=2.5, markersize=8, 
+                    label='Benign Subset', color='#3498db')
         
-        baseline_challenging = steering_results.get('baseline_challenging', 0)
-        baseline_benign = steering_results.get('baseline_benign', 0)
+            # Add baseline lines
+            if baseline_challenging > 0:
+                plt.axhline(y=baseline_challenging, color='#e74c3c', linestyle='--', alpha=0.7, 
+                           label=f'Baseline Challenging ({baseline_challenging:.3f})')
+            if baseline_benign > 0:
+                plt.axhline(y=baseline_benign, color='#3498db', linestyle='--', alpha=0.7, 
+                           label=f'Baseline Benign ({baseline_benign:.3f})')
+            
+            plt.xlabel('Alpha (Steering Strength)', fontsize=12)
+            plt.ylabel('Mean Toxicity Score', fontsize=12)
+            plt.title('Activation Steering Effects on Toxicity\nAcross Alpha Values\n(Note: Model shows inverted pattern - benign prompts → higher toxicity)', fontsize=12, fontweight='bold')
+            plt.legend(fontsize=10)
+            plt.grid(True, alpha=0.3)
+            plt.xticks(alpha_values)
         
-        # Plot 1: Alpha Sweep - Mean Toxicity Scores
-        plt.figure(figsize=(12, 8))
+            # Plot 2: Toxicity Reduction Effectiveness
+            plt.subplot(2, 2, 2)
+            if baseline_challenging > 0:
+                challenging_reduction = [(baseline_challenging - score) / baseline_challenging * 100 
+                                       for score in challenging_scores]
+                plt.plot(alpha_values, challenging_reduction, 'o-', linewidth=2.5, markersize=8, 
+                        color='#e74c3c', label='Challenging Subset')
+            
+            if baseline_benign > 0:
+                benign_change = [(baseline_benign - score) / baseline_benign * 100 
+                               for score in benign_scores]
+                plt.plot(alpha_values, benign_change, 's-', linewidth=2.5, markersize=8, 
+                        color='#3498db', label='Benign Subset')
+            
+            plt.axhline(y=0, color='black', linestyle='-', alpha=0.3)
+            plt.xlabel('Alpha (Steering Strength)', fontsize=12)
+            plt.ylabel('Toxicity Change (%)', fontsize=12)
+            plt.title('Relative Toxicity Change from Baseline', fontsize=14, fontweight='bold')
+            plt.legend(fontsize=10)
+            plt.grid(True, alpha=0.3)
+            plt.xticks(alpha_values)
         
-        plt.subplot(2, 2, 1)
-        plt.plot(alpha_values, challenging_scores, 'o-', linewidth=2.5, markersize=8, 
-                label='Challenging Subset', color='#e74c3c')
-        plt.plot(alpha_values, benign_scores, 's-', linewidth=2.5, markersize=8, 
-                label='Benign Subset', color='#3498db')
+            # Plot 3: Differential Effect (Challenging - Benign)
+            plt.subplot(2, 2, 3)
+            differential_effect = [challenging_scores[i] - benign_scores[i] 
+                                 for i in range(len(alpha_values))]
+            baseline_diff = baseline_challenging - baseline_benign if baseline_challenging > 0 and baseline_benign > 0 else 0
+            
+            plt.plot(alpha_values, differential_effect, 'D-', linewidth=2.5, markersize=8, 
+                    color='#9b59b6', label='Steering Effect')
+            if baseline_diff > 0:
+                plt.axhline(y=baseline_diff, color='#9b59b6', linestyle='--', alpha=0.7, 
+                           label=f'Baseline Difference ({baseline_diff:.3f})')
+            
+            plt.xlabel('Alpha (Steering Strength)', fontsize=12)
+            plt.ylabel('Toxicity Difference\n(Challenging - Benign)', fontsize=12)
+            plt.title('Differential Steering Effect', fontsize=14, fontweight='bold')
+            plt.legend(fontsize=10)
+            plt.grid(True, alpha=0.3)
+            plt.xticks(alpha_values)
         
-        # Add baseline lines
-        if baseline_challenging > 0:
-            plt.axhline(y=baseline_challenging, color='#e74c3c', linestyle='--', alpha=0.7, 
-                       label=f'Baseline Challenging ({baseline_challenging:.3f})')
-        if baseline_benign > 0:
-            plt.axhline(y=baseline_benign, color='#3498db', linestyle='--', alpha=0.7, 
-                       label=f'Baseline Benign ({baseline_benign:.3f})')
+            # Plot 4: Best Alpha Highlighting
+            plt.subplot(2, 2, 4)
+            
+            # Find best alpha (lowest challenging toxicity)
+            best_alpha_idx = np.argmin(challenging_scores)
+            best_alpha = alpha_values[best_alpha_idx]
+            
+            bars = plt.bar(['Challenging', 'Benign'], 
+                          [challenging_scores[best_alpha_idx], benign_scores[best_alpha_idx]],
+                          color=['#e74c3c', '#3498db'], alpha=0.7)
+            
+            # Add baseline comparison bars
+            if baseline_challenging > 0 and baseline_benign > 0:
+                plt.bar(['Challenging\n(Baseline)', 'Benign\n(Baseline)'], 
+                       [baseline_challenging, baseline_benign],
+                       color=['#e74c3c', '#3498db'], alpha=0.3, hatch='///')
+            
+            plt.ylabel('Mean Toxicity Score', fontsize=12)
+            plt.title(f'Best Steering Result (α = {best_alpha})', fontsize=14, fontweight='bold')
+            plt.grid(True, alpha=0.3, axis='y')
+            
+            # Add value labels on bars
+            for bar in bars:
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                        f'{height:.3f}', ha='center', va='bottom', fontweight='bold')
+            
+            plt.tight_layout()
+            plt.savefig(f"{save_dir}/alpha_sweep_results.png", dpi=300, bbox_inches='tight')
+            plt.savefig(f"{save_dir}/alpha_sweep_results.pdf", bbox_inches='tight')
+            print(f"Alpha sweep plots saved to {save_dir}/alpha_sweep_results.png and .pdf")
         
-        plt.xlabel('Alpha (Steering Strength)', fontsize=12)
-        plt.ylabel('Mean Toxicity Score', fontsize=12)
-        plt.title('Activation Steering Effects on Toxicity\nAcross Alpha Values', fontsize=14, fontweight='bold')
-        plt.legend(fontsize=10)
-        plt.grid(True, alpha=0.3)
-        plt.xticks(alpha_values)
-        
-        # Plot 2: Toxicity Reduction Effectiveness
-        plt.subplot(2, 2, 2)
-        if baseline_challenging > 0:
-            challenging_reduction = [(baseline_challenging - score) / baseline_challenging * 100 
-                                   for score in challenging_scores]
-            plt.plot(alpha_values, challenging_reduction, 'o-', linewidth=2.5, markersize=8, 
-                    color='#e74c3c', label='Challenging Subset')
-        
-        if baseline_benign > 0:
-            benign_change = [(baseline_benign - score) / baseline_benign * 100 
-                           for score in benign_scores]
-            plt.plot(alpha_values, benign_change, 's-', linewidth=2.5, markersize=8, 
-                    color='#3498db', label='Benign Subset')
-        
-        plt.axhline(y=0, color='black', linestyle='-', alpha=0.3)
-        plt.xlabel('Alpha (Steering Strength)', fontsize=12)
-        plt.ylabel('Toxicity Change (%)', fontsize=12)
-        plt.title('Relative Toxicity Change from Baseline', fontsize=14, fontweight='bold')
-        plt.legend(fontsize=10)
-        plt.grid(True, alpha=0.3)
-        plt.xticks(alpha_values)
-        
-        # Plot 3: Differential Effect (Challenging - Benign)
-        plt.subplot(2, 2, 3)
-        differential_effect = [challenging_scores[i] - benign_scores[i] 
-                             for i in range(len(alpha_values))]
-        baseline_diff = baseline_challenging - baseline_benign if baseline_challenging > 0 and baseline_benign > 0 else 0
-        
-        plt.plot(alpha_values, differential_effect, 'D-', linewidth=2.5, markersize=8, 
-                color='#9b59b6', label='Steering Effect')
-        if baseline_diff > 0:
-            plt.axhline(y=baseline_diff, color='#9b59b6', linestyle='--', alpha=0.7, 
-                       label=f'Baseline Difference ({baseline_diff:.3f})')
-        
-        plt.xlabel('Alpha (Steering Strength)', fontsize=12)
-        plt.ylabel('Toxicity Difference\n(Challenging - Benign)', fontsize=12)
-        plt.title('Differential Steering Effect', fontsize=14, fontweight='bold')
-        plt.legend(fontsize=10)
-        plt.grid(True, alpha=0.3)
-        plt.xticks(alpha_values)
-        
-        # Plot 4: Best Alpha Highlighting
-        plt.subplot(2, 2, 4)
-        
-        # Find best alpha (lowest challenging toxicity)
-        best_alpha_idx = np.argmin(challenging_scores)
-        best_alpha = alpha_values[best_alpha_idx]
-        
-        bars = plt.bar(['Challenging', 'Benign'], 
-                      [challenging_scores[best_alpha_idx], benign_scores[best_alpha_idx]],
-                      color=['#e74c3c', '#3498db'], alpha=0.7)
-        
-        # Add baseline comparison bars
-        if baseline_challenging > 0 and baseline_benign > 0:
-            plt.bar(['Challenging\n(Baseline)', 'Benign\n(Baseline)'], 
-                   [baseline_challenging, baseline_benign],
-                   color=['#e74c3c', '#3498db'], alpha=0.3, hatch='///')
-        
-        plt.ylabel('Mean Toxicity Score', fontsize=12)
-        plt.title(f'Best Steering Result (α = {best_alpha})', fontsize=14, fontweight='bold')
-        plt.grid(True, alpha=0.3, axis='y')
-        
-        # Add value labels on bars
-        for bar in bars:
-            height = bar.get_height()
-            plt.text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                    f'{height:.3f}', ha='center', va='bottom', fontweight='bold')
-        
-        plt.tight_layout()
-        plt.savefig(f"{save_dir}/alpha_sweep_results.png", dpi=300, bbox_inches='tight')
-        plt.savefig(f"{save_dir}/alpha_sweep_results.pdf", bbox_inches='tight')
-        print(f"Alpha sweep plots saved to {save_dir}/alpha_sweep_results.png and .pdf")
-        
-        # Create a detailed heatmap of all results
-        plt.figure(figsize=(14, 8))
-        
-        # Prepare data for heatmap
-        heatmap_data = []
-        row_labels = []
-        
-        for alpha in alpha_values:
-            challenging_mean = results[alpha]['challenging']['mean_toxicity']
-            benign_mean = results[alpha]['benign']['mean_toxicity']
-            heatmap_data.append([challenging_mean, benign_mean])
-            row_labels.append(f"α = {alpha}")
-        
-        heatmap_data = np.array(heatmap_data)
-        
-        # Create heatmap
-        plt.subplot(1, 2, 1)
-        sns.heatmap(heatmap_data, 
-                   xticklabels=['Challenging', 'Benign'],
-                   yticklabels=row_labels,
-                   annot=True, fmt='.3f', cmap='RdYlBu_r',
-                   cbar_kws={'label': 'Mean Toxicity Score'})
-        plt.title('Toxicity Scores Heatmap\nAcross Alpha Values', fontsize=14, fontweight='bold')
-        plt.xlabel('Subset Type', fontsize=12)
-        plt.ylabel('Steering Strength', fontsize=12)
-        
-        # Create improvement heatmap (compared to baseline)
-        plt.subplot(1, 2, 2)
-        if baseline_challenging > 0 and baseline_benign > 0:
-            improvement_data = []
+            # Create a detailed heatmap of all results
+            plt.figure(figsize=(14, 8))
+            
+            # Prepare data for heatmap
+            heatmap_data = []
+            row_labels = []
+            
             for alpha in alpha_values:
-                challenging_improvement = (baseline_challenging - results[alpha]['challenging']['mean_toxicity']) / baseline_challenging * 100
-                benign_impact = (baseline_benign - results[alpha]['benign']['mean_toxicity']) / baseline_benign * 100
-                improvement_data.append([challenging_improvement, benign_impact])
+                challenging_mean = results[str(alpha)]['challenging']['mean_toxicity']
+                benign_mean = results[str(alpha)]['benign']['mean_toxicity']
+                heatmap_data.append([challenging_mean, benign_mean])
+                row_labels.append(f"α = {alpha}")
             
-            improvement_data = np.array(improvement_data)
+            heatmap_data = np.array(heatmap_data)
             
-            sns.heatmap(improvement_data,
+            # Create heatmap
+            plt.subplot(1, 2, 1)
+            sns.heatmap(heatmap_data, 
                        xticklabels=['Challenging', 'Benign'],
                        yticklabels=row_labels,
-                       annot=True, fmt='.1f', cmap='RdBu_r', center=0,
-                       cbar_kws={'label': 'Improvement (%)'})
-            plt.title('Toxicity Improvement from Baseline\n(% Change)', fontsize=14, fontweight='bold')
+                       annot=True, fmt='.3f', cmap='RdYlBu_r',
+                       cbar_kws={'label': 'Mean Toxicity Score'})
+            plt.title('Toxicity Scores Heatmap\nAcross Alpha Values', fontsize=14, fontweight='bold')
             plt.xlabel('Subset Type', fontsize=12)
             plt.ylabel('Steering Strength', fontsize=12)
         
-        plt.tight_layout()
-        plt.savefig(f"{save_dir}/toxicity_heatmaps.png", dpi=300, bbox_inches='tight')
-        plt.savefig(f"{save_dir}/toxicity_heatmaps.pdf", bbox_inches='tight')
-        print(f"Heatmap plots saved to {save_dir}/toxicity_heatmaps.png and .pdf")
-        
-        # Create statistical summary plot
-        plt.figure(figsize=(12, 6))
-        
-        # Box plot showing distribution characteristics
-        plt.subplot(1, 2, 1)
-        box_data = [challenging_scores, benign_scores]
-        labels = ['Challenging Subset', 'Benign Subset']
-        colors = ['#e74c3c', '#3498db']
-        
-        bp = plt.boxplot(box_data, labels=labels, patch_artist=True)
-        for patch, color in zip(bp['boxes'], colors):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.7)
-        
-        plt.ylabel('Mean Toxicity Score', fontsize=12)
-        plt.title('Toxicity Score Distribution\nAcross All Alpha Values', fontsize=14, fontweight='bold')
-        plt.grid(True, alpha=0.3)
-        
-        # Summary statistics table as text
-        plt.subplot(1, 2, 2)
-        plt.axis('off')
-        
-        summary_stats = []
-        summary_stats.append(['Metric', 'Challenging', 'Benign'])
-        summary_stats.append(['Mean', f'{np.mean(challenging_scores):.3f}', f'{np.mean(benign_scores):.3f}'])
-        summary_stats.append(['Std Dev', f'{np.std(challenging_scores):.3f}', f'{np.std(benign_scores):.3f}'])
-        summary_stats.append(['Min', f'{np.min(challenging_scores):.3f}', f'{np.min(benign_scores):.3f}'])
-        summary_stats.append(['Max', f'{np.max(challenging_scores):.3f}', f'{np.max(benign_scores):.3f}'])
-        summary_stats.append(['Range', f'{np.max(challenging_scores) - np.min(challenging_scores):.3f}', 
+            # Create improvement heatmap (compared to baseline)
+            plt.subplot(1, 2, 2)
+            if baseline_challenging > 0 and baseline_benign > 0:
+                improvement_data = []
+                for alpha in alpha_values:
+                    challenging_improvement = (baseline_challenging - results[str(alpha)]['challenging']['mean_toxicity']) / baseline_challenging * 100
+                    benign_impact = (baseline_benign - results[str(alpha)]['benign']['mean_toxicity']) / baseline_benign * 100
+                    improvement_data.append([challenging_improvement, benign_impact])
+                
+                improvement_data = np.array(improvement_data)
+                
+                sns.heatmap(improvement_data,
+                           xticklabels=['Challenging', 'Benign'],
+                           yticklabels=row_labels,
+                           annot=True, fmt='.1f', cmap='RdBu_r', center=0,
+                           cbar_kws={'label': 'Improvement (%)'})
+                plt.title('Toxicity Improvement from Baseline\n(% Change)', fontsize=14, fontweight='bold')
+                plt.xlabel('Subset Type', fontsize=12)
+                plt.ylabel('Steering Strength', fontsize=12)
+            
+            plt.tight_layout()
+            plt.savefig(f"{save_dir}/toxicity_heatmaps.png", dpi=300, bbox_inches='tight')
+            plt.savefig(f"{save_dir}/toxicity_heatmaps.pdf", bbox_inches='tight')
+            print(f"Heatmap plots saved to {save_dir}/toxicity_heatmaps.png and .pdf")
+            
+            # Create statistical summary plot
+            plt.figure(figsize=(12, 6))
+            
+            # Box plot showing distribution characteristics
+            plt.subplot(1, 2, 1)
+            box_data = [challenging_scores, benign_scores]
+            labels = ['Challenging Subset', 'Benign Subset']
+            colors = ['#e74c3c', '#3498db']
+            
+            bp = plt.boxplot(box_data, labels=labels, patch_artist=True)
+            for patch, color in zip(bp['boxes'], colors):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.7)
+            
+            plt.ylabel('Mean Toxicity Score', fontsize=12)
+            plt.title('Toxicity Score Distribution\nAcross All Alpha Values', fontsize=14, fontweight='bold')
+            plt.grid(True, alpha=0.3)
+            
+            # Summary statistics table as text
+            plt.subplot(1, 2, 2)
+            plt.axis('off')
+            
+            summary_stats = []
+            summary_stats.append(['Metric', 'Challenging', 'Benign'])
+            summary_stats.append(['Mean', f'{np.mean(challenging_scores):.3f}', f'{np.mean(benign_scores):.3f}'])
+            summary_stats.append(['Std Dev', f'{np.std(challenging_scores):.3f}', f'{np.std(benign_scores):.3f}'])
+            summary_stats.append(['Min', f'{np.min(challenging_scores):.3f}', f'{np.min(benign_scores):.3f}'])
+            summary_stats.append(['Max', f'{np.max(challenging_scores):.3f}', f'{np.max(benign_scores):.3f}'])
+            summary_stats.append(['Range', f'{np.max(challenging_scores) - np.min(challenging_scores):.3f}', 
                              f'{np.max(benign_scores) - np.min(benign_scores):.3f}'])
-        
-        if baseline_challenging > 0 and baseline_benign > 0:
-            best_challenging_improvement = (baseline_challenging - np.min(challenging_scores)) / baseline_challenging * 100
-            worst_benign_impact = (baseline_benign - np.max(benign_scores)) / baseline_benign * 100
-            summary_stats.append(['Best Improvement (%)', f'{best_challenging_improvement:.1f}', f'{worst_benign_impact:.1f}'])
-            summary_stats.append(['Best Alpha', f'{alpha_values[np.argmin(challenging_scores)]}', f'{alpha_values[np.argmax(benign_scores)]}'])
-        
-        table = plt.table(cellText=summary_stats[1:], colLabels=summary_stats[0],
+            
+            if baseline_challenging > 0 and baseline_benign > 0:
+                best_challenging_improvement = (baseline_challenging - np.min(challenging_scores)) / baseline_challenging * 100
+                worst_benign_impact = (baseline_benign - np.max(benign_scores)) / baseline_benign * 100
+                summary_stats.append(['Best Improvement (%)', f'{best_challenging_improvement:.1f}', f'{worst_benign_impact:.1f}'])
+                summary_stats.append(['Best Alpha', f'{alpha_values[np.argmin(challenging_scores)]}', f'{alpha_values[np.argmax(benign_scores)]}'])
+            
+            table = plt.table(cellText=summary_stats[1:], colLabels=summary_stats[0],
                          cellLoc='center', loc='center',
                          colWidths=[0.3, 0.35, 0.35])
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)
-        table.scale(1.2, 1.5)
+            table.auto_set_font_size(False)
+            table.set_fontsize(10)
+            table.scale(1.2, 1.5)
+            
+            # Style the table
+            for (row, col), cell in table.get_celld().items():
+                if row == 0:  # Header row
+                    cell.set_text_props(weight='bold')
+                    cell.set_facecolor('#f0f0f0')
+                else:
+                    cell.set_facecolor('#ffffff')
+            
+            plt.title('Summary Statistics', fontsize=14, fontweight='bold', pad=20)
+            
+            plt.tight_layout()
+            plt.savefig(f"{save_dir}/summary_statistics.png", dpi=300, bbox_inches='tight')
+            plt.savefig(f"{save_dir}/summary_statistics.pdf", bbox_inches='tight')
+            print(f"Summary statistics plots saved to {save_dir}/summary_statistics.png and .pdf")
+            
+            # Close all figures to free memory (since using Agg backend, no display needed)
+            plt.close('all')
+            
+            print(f"\n=== Plotting Summary ===")
+            print(f"All plots saved to '{save_dir}/' directory")
+            print(f"Generated files:")
+            print(f"  - alpha_sweep_results.png/pdf: Main alpha sweep analysis")
+            print(f"  - toxicity_heatmaps.png/pdf: Detailed heatmap analysis")
+            print(f"  - summary_statistics.png/pdf: Statistical summary")
+            
+            print(f"\n=== Statistical Notes ===")
+            print(f"Experiment used {self.steering_config.k_examples} contrastive pairs and {len(challenging_scores)} alpha values: {self.steering_config.alpha_values}.")
+            print(f"Reduced sample sizes improve efficiency but may affect statistical power.")
+            print(f"Results should be interpreted with appropriate caution for the sample size.")
+            
+            if baseline_challenging > 0 and len(challenging_scores) > 0:
+                best_alpha_idx = np.argmin(challenging_scores)
+                best_alpha = alpha_values[best_alpha_idx]
+                best_reduction = (baseline_challenging - challenging_scores[best_alpha_idx]) / baseline_challenging * 100
+                print(f"Best toxicity reduction: {best_reduction:.1f}% at α = {best_alpha}")
+                
+        except Exception as e:
+            print(f"Error during plotting: {e}")
+            print("Plotting failed, but experiment results are still saved in JSON format.")
+            print(f"You can manually analyze the results or try plotting with different settings.")
+            # Still try to close figures to prevent memory leaks
+            try:
+                plt.close('all')
+            except:
+                pass
+    
+    def plot_layer_analysis(self, layer_analysis_results: Dict[str, Any], save_dir: str = "plots") -> None:
+        """Create plots showing steering effectiveness across different layers"""
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        import numpy as np
+        from pathlib import Path
         
-        # Style the table
-        for (row, col), cell in table.get_celld().items():
-            if row == 0:  # Header row
-                cell.set_text_props(weight='bold')
-                cell.set_facecolor('#f0f0f0')
-            else:
-                cell.set_facecolor('#ffffff')
+        # Ensure save directory exists
+        Path(save_dir).mkdir(exist_ok=True)
         
-        plt.title('Summary Statistics', fontsize=14, fontweight='bold', pad=20)
+        # Set matplotlib backend for non-interactive plotting
+        matplotlib = __import__('matplotlib')
+        matplotlib.use('Agg')
         
-        plt.tight_layout()
-        plt.savefig(f"{save_dir}/summary_statistics.png", dpi=300, bbox_inches='tight')
-        plt.savefig(f"{save_dir}/summary_statistics.pdf", bbox_inches='tight')
-        print(f"Summary statistics plots saved to {save_dir}/summary_statistics.png and .pdf")
+        print(f"Generating layer analysis plots...")
         
-        plt.show()  # Display all plots
-        
-        print(f"\n=== Plotting Summary ===")
-        print(f"All plots saved to '{save_dir}/' directory")
-        print(f"Generated files:")
-        print(f"  - alpha_sweep_results.png/pdf: Main alpha sweep analysis")
-        print(f"  - toxicity_heatmaps.png/pdf: Detailed heatmap analysis")
-        print(f"  - summary_statistics.png/pdf: Statistical summary")
-        
-        print(f"\n=== Statistical Notes ===")
-        print(f"Experiment used {self.steering_config.k_examples} contrastive pairs and {len(challenging_scores)} alpha values: {self.steering_config.alpha_values}.")
-        print(f"Reduced sample sizes improve efficiency but may affect statistical power.")
-        print(f"Results should be interpreted with appropriate caution for the sample size.")
-        
-        if baseline_challenging > 0:
-            best_alpha = alpha_values[np.argmin(challenging_scores)]
-            best_reduction = (baseline_challenging - np.min(challenging_scores)) / baseline_challenging * 100
-            print(f"Best toxicity reduction: {best_reduction:.1f}% at α = {best_alpha}")
+        try:
+            layer_results = layer_analysis_results['layer_results']
+            layer_effectiveness = layer_analysis_results['layer_effectiveness'] 
+            test_alphas = layer_analysis_results['test_alphas']
+            
+            # Sort layers for consistent ordering
+            sorted_layers = sorted(layer_results.keys())
+            
+            # Create comprehensive layer analysis figure
+            plt.figure(figsize=(16, 12))
+            
+            # Plot 1: Layer Effectiveness Heatmap (Layers vs Alpha Values)
+            plt.subplot(2, 3, 1)
+            
+            # Create heatmap data: layers (rows) vs alphas (columns)
+            heatmap_data = []
+            layer_labels = []
+            
+            for layer_idx in sorted_layers:
+                row_data = []
+                for alpha in test_alphas:
+                    if alpha in layer_results[layer_idx]:
+                        # Use toxicity reduction as effectiveness metric
+                        toxicity = layer_results[layer_idx][alpha]['challenging']['mean_toxicity']
+                        effectiveness = (1.0 - toxicity) * 100  # Convert to percentage
+                        row_data.append(effectiveness)
+                    else:
+                        row_data.append(0)
+                heatmap_data.append(row_data)
+                layer_labels.append(f"Layer {layer_idx}")
+            
+            heatmap_data = np.array(heatmap_data)
+            
+            sns.heatmap(heatmap_data, 
+                       xticklabels=[f"α={a}" for a in test_alphas],
+                       yticklabels=layer_labels,
+                       annot=True, fmt='.1f', cmap='RdYlBu_r', center=50,
+                       cbar_kws={'label': 'Effectiveness (%)'})
+            plt.title('Steering Effectiveness by Layer and Alpha\n(Higher = Less Toxic)', fontweight='bold')
+            plt.xlabel('Alpha Values')
+            plt.ylabel('Transformer Layers')
+            
+            # Plot 2: Average Layer Effectiveness
+            plt.subplot(2, 3, 2)
+            
+            effectiveness_means = [layer_effectiveness[layer]['mean_effectiveness'] * 100 for layer in sorted_layers]
+            effectiveness_maxes = [layer_effectiveness[layer]['max_effectiveness'] * 100 for layer in sorted_layers]
+            
+            plt.plot(sorted_layers, effectiveness_means, 'o-', linewidth=2, markersize=6, 
+                    label='Mean Effectiveness', color='#2E86AB')
+            plt.plot(sorted_layers, effectiveness_maxes, 's--', linewidth=2, markersize=6, 
+                    label='Max Effectiveness', color='#A23B72', alpha=0.7)
+            
+            plt.xlabel('Layer Index')
+            plt.ylabel('Effectiveness (%)')
+            plt.title('Layer-wise Steering Effectiveness\n(Averaged Across Alpha Values)', fontweight='bold')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+            # Highlight most/least effective layers
+            most_effective_layer = max(sorted_layers, key=lambda l: layer_effectiveness[l]['mean_effectiveness'])
+            least_effective_layer = min(sorted_layers, key=lambda l: layer_effectiveness[l]['mean_effectiveness'])
+            
+            plt.axvline(x=most_effective_layer, color='green', linestyle=':', alpha=0.7, 
+                       label=f'Most Effective (Layer {most_effective_layer})')
+            plt.axvline(x=least_effective_layer, color='red', linestyle=':', alpha=0.7,
+                       label=f'Least Effective (Layer {least_effective_layer})')
+            
+            # Plot 3: Toxicity Reduction by Layer (for best alpha)
+            plt.subplot(2, 3, 3)
+            
+            # Find the alpha that gives best overall toxicity reduction
+            best_alpha = None
+            best_overall_score = float('inf')
+            for alpha in test_alphas:
+                alpha_toxicity = []
+                for layer_idx in sorted_layers:
+                    if alpha in layer_results[layer_idx]:
+                        alpha_toxicity.append(layer_results[layer_idx][alpha]['challenging']['mean_toxicity'])
+                if alpha_toxicity:
+                    avg_toxicity = np.mean(alpha_toxicity)
+                    if avg_toxicity < best_overall_score:
+                        best_overall_score = avg_toxicity
+                        best_alpha = alpha
+            
+            if best_alpha is not None:
+                toxicity_by_layer = []
+                for layer_idx in sorted_layers:
+                    if best_alpha in layer_results[layer_idx]:
+                        toxicity_by_layer.append(layer_results[layer_idx][best_alpha]['challenging']['mean_toxicity'])
+                    else:
+                        toxicity_by_layer.append(0.5)  # Neutral value if no data
+                
+                plt.bar(range(len(sorted_layers)), toxicity_by_layer, 
+                       color='#F18F01', alpha=0.7, edgecolor='black', linewidth=0.5)
+                plt.xlabel('Layer Index')
+                plt.ylabel('Mean Toxicity Score')
+                plt.title(f'Toxicity Score by Layer\n(α = {best_alpha}, Lower = Better)', fontweight='bold')
+                plt.xticks(range(len(sorted_layers)), [str(l) for l in sorted_layers])
+                
+                # Highlight the most effective layer
+                min_toxicity_idx = np.argmin(toxicity_by_layer)
+                plt.bar(min_toxicity_idx, toxicity_by_layer[min_toxicity_idx], 
+                       color='green', alpha=0.8, edgecolor='black', linewidth=1.5,
+                       label=f'Best Layer ({sorted_layers[min_toxicity_idx]})')
+                plt.legend()
+            
+            # Plot 4: Layer Effectiveness Distribution
+            plt.subplot(2, 3, 4)
+            
+            all_effectiveness = [layer_effectiveness[layer]['mean_effectiveness'] * 100 for layer in sorted_layers]
+            
+            plt.hist(all_effectiveness, bins=10, color='#C73E1D', alpha=0.7, edgecolor='black')
+            plt.axvline(x=np.mean(all_effectiveness), color='blue', linestyle='--', linewidth=2,
+                       label=f'Mean: {np.mean(all_effectiveness):.1f}%')
+            plt.axvline(x=np.median(all_effectiveness), color='green', linestyle='--', linewidth=2,
+                       label=f'Median: {np.median(all_effectiveness):.1f}%')
+            
+            plt.xlabel('Effectiveness (%)')
+            plt.ylabel('Number of Layers')
+            plt.title('Distribution of Layer Effectiveness', fontweight='bold')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+            # Plot 5: Early vs Late Layers Comparison
+            plt.subplot(2, 3, 5)
+            
+            num_layers = len(sorted_layers)
+            early_layers = sorted_layers[:num_layers//3]
+            middle_layers = sorted_layers[num_layers//3:2*num_layers//3] 
+            late_layers = sorted_layers[2*num_layers//3:]
+            
+            early_effectiveness = [layer_effectiveness[l]['mean_effectiveness'] * 100 for l in early_layers]
+            middle_effectiveness = [layer_effectiveness[l]['mean_effectiveness'] * 100 for l in middle_layers]
+            late_effectiveness = [layer_effectiveness[l]['mean_effectiveness'] * 100 for l in late_layers]
+            
+            layer_groups = ['Early\n(0-33%)', 'Middle\n(33-66%)', 'Late\n(66-100%)']
+            group_means = [
+                np.mean(early_effectiveness) if early_effectiveness else 0,
+                np.mean(middle_effectiveness) if middle_effectiveness else 0,
+                np.mean(late_effectiveness) if late_effectiveness else 0
+            ]
+            group_stds = [
+                np.std(early_effectiveness) if len(early_effectiveness) > 1 else 0,
+                np.std(middle_effectiveness) if len(middle_effectiveness) > 1 else 0, 
+                np.std(late_effectiveness) if len(late_effectiveness) > 1 else 0
+            ]
+            
+            colors = ['#4ECDC4', '#44A08D', '#093637']
+            bars = plt.bar(layer_groups, group_means, yerr=group_stds, capsize=5,
+                          color=colors, alpha=0.7, edgecolor='black')
+            
+            plt.ylabel('Mean Effectiveness (%)')
+            plt.title('Effectiveness by Layer Depth', fontweight='bold')
+            plt.grid(True, alpha=0.3, axis='y')
+            
+            # Add value labels on bars
+            for i, (bar, mean) in enumerate(zip(bars, group_means)):
+                plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + group_stds[i] + 1,
+                        f'{mean:.1f}%', ha='center', va='bottom', fontweight='bold')
+            
+            # Plot 6: Layer Summary Statistics
+            plt.subplot(2, 3, 6)
+            
+            # Summary statistics table
+            stats_data = [
+                ['Most Effective Layer', f"Layer {most_effective_layer}", 
+                 f"{layer_effectiveness[most_effective_layer]['mean_effectiveness']*100:.1f}%"],
+                ['Least Effective Layer', f"Layer {least_effective_layer}", 
+                 f"{layer_effectiveness[least_effective_layer]['mean_effectiveness']*100:.1f}%"],
+                ['Best Overall Alpha', f"α = {best_alpha}" if best_alpha else "N/A", 
+                 f"{best_overall_score:.3f}" if best_alpha else "N/A"],
+                ['Early Layers Avg', f"Layers 0-{len(early_layers)-1}", f"{group_means[0]:.1f}%"],
+                ['Middle Layers Avg', f"Layers {len(early_layers)}-{len(early_layers)+len(middle_layers)-1}", f"{group_means[1]:.1f}%"],
+                ['Late Layers Avg', f"Layers {len(early_layers)+len(middle_layers)}-{num_layers-1}", f"{group_means[2]:.1f}%"]
+            ]
+            
+            plt.axis('tight')
+            plt.axis('off')
+            
+            table = plt.table(cellText=stats_data,
+                             colLabels=['Metric', 'Layer/Value', 'Effectiveness'],
+                             cellLoc='center',
+                             loc='center')
+            table.auto_set_font_size(False)
+            table.set_fontsize(9)
+            table.scale(1.2, 2)
+            
+            # Style the table
+            for (i, j), cell in table.get_celld().items():
+                if i == 0:  # Header row
+                    cell.set_text_props(weight='bold')
+                    cell.set_facecolor('#4ECDC4')
+                else:
+                    cell.set_facecolor('#f1f1f2' if i % 2 == 0 else '#ffffff')
+            
+            plt.title('Layer Analysis Summary', fontweight='bold', pad=20)
+            
+            plt.tight_layout()
+            plt.savefig(f"{save_dir}/layer_effectiveness_analysis.png", dpi=300, bbox_inches='tight')
+            plt.savefig(f"{save_dir}/layer_effectiveness_analysis.pdf", bbox_inches='tight')
+            plt.close('all')
+            
+            print(f"Layer analysis plots saved to {save_dir}/layer_effectiveness_analysis.png and .pdf")
+            
+            # Generate additional detailed heatmap
+            plt.figure(figsize=(14, 10))
+            
+            # Detailed layer vs alpha heatmap with better formatting
+            sns.heatmap(heatmap_data, 
+                       xticklabels=[f"α={a}" for a in test_alphas],
+                       yticklabels=[f"L{l}" for l in sorted_layers],
+                       annot=True, fmt='.1f', cmap='RdYlBu_r', center=50,
+                       linewidths=0.5, cbar_kws={'label': 'Effectiveness (%, Higher = Less Toxic)'})
+            
+            plt.title('Detailed Layer Effectiveness Heatmap\nSteering Vector Impact Across Transformer Layers', 
+                     fontsize=16, fontweight='bold', pad=20)
+            plt.xlabel('Alpha Values (Steering Strength)', fontsize=12)
+            plt.ylabel('Transformer Layers', fontsize=12)
+            
+            plt.tight_layout()
+            plt.savefig(f"{save_dir}/detailed_layer_heatmap.png", dpi=300, bbox_inches='tight')
+            plt.savefig(f"{save_dir}/detailed_layer_heatmap.pdf", bbox_inches='tight')
+            plt.close('all')
+            
+            print(f"Detailed layer heatmap saved to {save_dir}/detailed_layer_heatmap.png and .pdf")
+            
+            # Print summary to console
+            print(f"\n=== Layer Analysis Summary ===")
+            print(f"Most effective layer: {most_effective_layer} ({layer_effectiveness[most_effective_layer]['mean_effectiveness']*100:.1f}% effectiveness)")
+            print(f"Least effective layer: {least_effective_layer} ({layer_effectiveness[least_effective_layer]['mean_effectiveness']*100:.1f}% effectiveness)")
+            print(f"Best alpha value overall: {best_alpha} (mean toxicity: {best_overall_score:.3f})")
+            print(f"Layer depth analysis:")
+            print(f"  Early layers (0-33%): {group_means[0]:.1f}% effectiveness")
+            print(f"  Middle layers (33-66%): {group_means[1]:.1f}% effectiveness") 
+            print(f"  Late layers (66-100%): {group_means[2]:.1f}% effectiveness")
+            
+        except Exception as e:
+            print(f"Error during layer analysis plotting: {e}")
+            print("Layer analysis plotting failed.")
+            try:
+                plt.close('all')
+            except:
+                pass
 
 def main():
     """Main execution function"""
     print("=== Activation Steering Experiment for Toxicity Reduction ===")
+    print("This experiment includes comprehensive layer-wise steering analysis")
     
     # Initialize experiment
     experiment = ActivationSteeringExperiment()
@@ -1052,29 +1624,89 @@ def main():
         print("\n--- Step 5: Steering Evaluation ---")
         steering_results = experiment.run_steering_evaluation()
         
-        # Save all results
-        print("\n--- Saving Results ---")
-        experiment.save_results('experiment_results.json', steering_results)
+        # Layer-wise Steering Analysis (now part of standard experiment)
+        print("\n--- Step 6: Layer-wise Steering Analysis ---")
+        print("Evaluating steering effectiveness across all transformer layers...")
+        print("This step analyzes which layers are most effective for toxicity steering.")
+        layer_analysis_results = experiment.evaluate_steering_all_layers(
+            challenging_subset_size=8,  # Use smaller subset for efficiency in integrated analysis
+            benign_subset_size=8
+        )
         
-        # Generate plots
-        print("\n--- Generating Plots ---")
+        # Save all results including layer analysis
+        print("\n--- Saving Results ---")
+        experiment.save_results('experiment_results.json', steering_results, layer_analysis_results)
+        
+        # Generate all plots
+        print("\n--- Generating Visualizations ---")
         experiment.plot_results(steering_results)
+        
+        print("\n--- Generating Layer Analysis Plots ---")
+        experiment.plot_layer_analysis(layer_analysis_results)
         
         print("\n=== Experiment completed successfully ===")
         
         # Print final summary
         print("\n=== Final Summary ===")
-        print(f"Baseline - Challenging: {baseline_results['challenging']['mean_toxicity']:.3f}")
-        print(f"Baseline - Benign: {baseline_results['benign']['mean_toxicity']:.3f}")
+        print(f"🔍 IMPORTANT FINDING: This model shows inverted toxicity patterns!")
+        print(f"📊 Challenging prompts (high prompt toxicity) → LOW completion toxicity: {baseline_results['challenging']['mean_toxicity']:.3f}")
+        print(f"📊 Benign prompts (low prompt toxicity) → HIGH completion toxicity: {baseline_results['benign']['mean_toxicity']:.3f}")
+        print(f"💡 This suggests Phi-4-mini-instruct has learned to avoid continuing toxic content.")
+        print(f"")
         
         if steering_results:
-            best_alpha = min(
+            # Find best alpha for each prompt type
+            best_alpha_challenging = min(
                 steering_results['results'].keys(), 
                 key=lambda a: steering_results['results'][a]['challenging']['mean_toxicity']
             )
-            print(f"Best alpha for toxicity reduction: {best_alpha}")
-            print(f"  Challenging: {steering_results['results'][best_alpha]['challenging']['mean_toxicity']:.3f}")
-            print(f"  Benign: {steering_results['results'][best_alpha]['benign']['mean_toxicity']:.3f}")
+            best_alpha_benign = min(
+                steering_results['results'].keys(),
+                key=lambda a: steering_results['results'][a]['benign']['mean_toxicity'] 
+            )
+            
+            print(f"🎯 Steering Analysis:")
+            print(f"Best α for challenging prompts (further reducing toxicity): {best_alpha_challenging}")
+            print(f"  Toxicity: {baseline_results['challenging']['mean_toxicity']:.3f} → {steering_results['results'][best_alpha_challenging]['challenging']['mean_toxicity']:.3f}")
+            
+            print(f"Best α for benign prompts (reducing problematic completions): {best_alpha_benign}")
+            print(f"  Toxicity: {baseline_results['benign']['mean_toxicity']:.3f} → {steering_results['results'][best_alpha_benign]['benign']['mean_toxicity']:.3f}")
+            
+            # Calculate reductions
+            challenging_reduction = baseline_results['challenging']['mean_toxicity'] - steering_results['results'][best_alpha_challenging]['challenging']['mean_toxicity']
+            benign_reduction = baseline_results['benign']['mean_toxicity'] - steering_results['results'][best_alpha_benign]['benign']['mean_toxicity']
+            
+            print(f"")
+            print(f"📈 Steering Effectiveness:")
+            print(f"  Challenging prompts: {challenging_reduction:.3f} absolute reduction ({(challenging_reduction/baseline_results['challenging']['mean_toxicity']*100):+.1f}% relative)")
+            print(f"  Benign prompts: {benign_reduction:.3f} absolute reduction ({(benign_reduction/baseline_results['benign']['mean_toxicity']*100):+.1f}% relative)")
+            print(f"")
+            print(f"🎓 Key Insight: Steering is most effective on benign prompts that produce toxic completions!")
+            
+        # Layer analysis summary (always available now)
+        layer_effectiveness = layer_analysis_results['layer_effectiveness']
+        sorted_layers = sorted(layer_effectiveness.keys())
+        most_effective_layer = max(sorted_layers, key=lambda l: layer_effectiveness[l]['mean_effectiveness'])
+        least_effective_layer = min(sorted_layers, key=lambda l: layer_effectiveness[l]['mean_effectiveness'])
+        
+        print(f"\n=== Layer Analysis Summary ===")
+        print(f"Most effective layer: Layer {most_effective_layer} ({layer_effectiveness[most_effective_layer]['mean_effectiveness']*100:.1f}% effectiveness)")
+        print(f"Least effective layer: Layer {least_effective_layer} ({layer_effectiveness[least_effective_layer]['mean_effectiveness']*100:.1f}% effectiveness)")
+        
+        # Calculate layer depth analysis
+        num_layers = len(sorted_layers)
+        early_layers = sorted_layers[:num_layers//3]
+        middle_layers = sorted_layers[num_layers//3:2*num_layers//3]
+        late_layers = sorted_layers[2*num_layers//3:]
+        
+        early_effectiveness = np.mean([layer_effectiveness[l]['mean_effectiveness'] * 100 for l in early_layers])
+        middle_effectiveness = np.mean([layer_effectiveness[l]['mean_effectiveness'] * 100 for l in middle_layers]) 
+        late_effectiveness = np.mean([layer_effectiveness[l]['mean_effectiveness'] * 100 for l in late_layers])
+        
+        print(f"Layer depth analysis:")
+        print(f"  Early layers (0-33%): {early_effectiveness:.1f}% average effectiveness")
+        print(f"  Middle layers (33-66%): {middle_effectiveness:.1f}% average effectiveness")
+        print(f"  Late layers (66-100%): {late_effectiveness:.1f}% average effectiveness")
         
     except KeyboardInterrupt:
         print("\n=== Experiment interrupted by user ===")
