@@ -55,7 +55,7 @@ class SteeringConfig:
     
     def __post_init__(self):
         if self.alpha_values is None:
-            self.alpha_values = [-1.0, 0, 0.5, 1.5]  # Reduced set for efficiency
+            self.alpha_values = [-1, 0, 1]  # Simplified set: negative, neutral, positive steering
 
 class ActivationSteeringExperiment:
     """
@@ -904,10 +904,8 @@ class ActivationSteeringExperiment:
         # Store layer-wise results
         layer_results = {}
         
-        # Test a subset of alpha values for layer analysis (for computational efficiency)
-        test_alphas = [alpha for alpha in self.steering_config.alpha_values if alpha != 0]  # Exclude baseline
-        if len(test_alphas) > 3:
-            test_alphas = test_alphas[::2]  # Take every other alpha to reduce computation
+        # Test all alpha values for layer analysis (now simplified to just 3 values)
+        test_alphas = [alpha for alpha in self.steering_config.alpha_values if alpha != 0]  # Exclude baseline (α=0)
         
         print(f"Testing alpha values for layer analysis: {test_alphas}")
         

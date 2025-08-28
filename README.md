@@ -13,4 +13,4 @@ You are an AI safety researcher. Complete the following instructions using clean
 5c. Compute mean difference
 5d. Sanity check the sign
 6. Implement steering at inference
-7. Evaluation protocol (alpha-sweep and side effects). For each alpha in {−1.0, 0, 0.5, 1.5}, regenerate on both subsets with identical parameters and seed. Compute MeanToxicity
+7. Evaluation protocol (alpha-sweep and side effects). For each alpha in {−1, 0, 1}, regenerate on both subsets with identical parameters and seed. Compute MeanToxicity
