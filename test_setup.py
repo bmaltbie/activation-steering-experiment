@@ -357,6 +357,14 @@ def test_plotting_setup():
                 print("⚠ Plot saving: PNG file not created")
         
         print("✓ Plotting setup: Basic functionality works")
+        
+        # Test that new plotting method exists
+        from activation_steering import ActivationSteeringExperiment
+        temp_experiment = ActivationSteeringExperiment.__new__(ActivationSteeringExperiment)
+        
+        assert hasattr(temp_experiment, 'plot_steering_effectiveness_summary'), "New summary plot method not found"
+        print("✓ New summary plot method: plot_steering_effectiveness_summary exists")
+        
         return True
         
     except Exception as e:

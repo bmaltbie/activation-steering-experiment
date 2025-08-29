@@ -1466,10 +1466,12 @@ class ActivationSteeringExperiment:
             plotter = PlottingHelper(steering_config)
             plotter.plot_results(steering_results, save_dir)
             
+            # Generate steering effectiveness summary
+            temp_experiment.plot_steering_effectiveness_summary(steering_results, save_dir)
+            
             # Generate layer analysis plots if data is available
             if 'layer_analysis_results' in saved_results:
                 print("Found layer analysis data, generating layer plots...")
-                temp_experiment = ActivationSteeringExperiment.__new__(ActivationSteeringExperiment)
                 temp_experiment.plot_layer_analysis(saved_results['layer_analysis_results'], save_dir)
                 print(f"✓ Layer analysis plots generated successfully")
             
@@ -1546,7 +1548,7 @@ class ActivationSteeringExperiment:
             
             plt.xlabel('Alpha (Steering Strength)', fontsize=12)
             plt.ylabel('Mean Toxicity Score', fontsize=12)
-            plt.title('Activation Steering Effects on Toxicity\nAcross Alpha Values\n(Note: Model shows inverted pattern - benign prompts → higher toxicity)', fontsize=12, fontweight='bold')
+            plt.title('Activation Steering Effects on Toxicity\nAcross Alpha Values', fontsize=12, fontweight='bold')
             plt.legend(fontsize=10)
             plt.grid(True, alpha=0.3)
             plt.xticks(alpha_values)
@@ -1734,6 +1736,9 @@ class ActivationSteeringExperiment:
             plt.savefig(f"{save_dir}/summary_statistics.pdf", bbox_inches='tight')
             print(f"Summary statistics plots saved to {save_dir}/summary_statistics.png and .pdf")
             
+            # Generate steering effectiveness summary
+            self.plot_steering_effectiveness_summary(steering_results, save_dir)
+            
             # Close all figures to free memory (since using Agg backend, no display needed)
             plt.close('all')
             
@@ -1743,6 +1748,10 @@ class ActivationSteeringExperiment:
             print(f"  - alpha_sweep_results.png/pdf: Main alpha sweep analysis")
             print(f"  - toxicity_heatmaps.png/pdf: Detailed heatmap analysis")
             print(f"  - summary_statistics.png/pdf: Statistical summary")
+            print(f"  - steering_effectiveness_summary.png/pdf: Overall effectiveness summary")
+            print(f"Plus layer analysis plots if layer data is available:")
+            print(f"  - layer_effectiveness_analysis.png/pdf: 6-panel layer analysis")
+            print(f"  - detailed_layer_heatmap.png/pdf: Layer vs alpha heatmap")
             
             print(f"\n=== Statistical Notes ===")
             print(f"Experiment used {self.steering_config.k_examples} contrastive pairs and {len(challenging_scores)} alpha values: {self.steering_config.alpha_values}.")
@@ -2021,6 +2030,219 @@ class ActivationSteeringExperiment:
         except Exception as e:
             print(f"Error during layer analysis plotting: {e}")
             print("Layer analysis plotting failed.")
+            try:
+                plt.close('all')
+            except:
+                pass
+    
+    def plot_steering_effectiveness_summary(self, steering_results: Dict[str, Any], save_dir: str = "plots") -> None:
+        """Create a high-level summary plot showing overall steering effectiveness vs baseline"""
+        print("Generating steering effectiveness summary plot...")
+        
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            from pathlib import Path
+            
+            # Ensure save directory exists
+            Path(save_dir).mkdir(parents=True, exist_ok=True)
+            
+            if not steering_results or 'results' not in steering_results:
+                print("Warning: No steering results available for effectiveness summary")
+                return
+            
+            results = steering_results['results']
+            baseline_challenging = steering_results.get('baseline_challenging', 0)
+            baseline_benign = steering_results.get('baseline_benign', 0)
+            
+            if baseline_challenging == 0 or baseline_benign == 0:
+                print("Warning: Baseline results not available for comparison")
+                return
+            
+            # Extract best steering results (usually alpha = 1)
+            best_alpha = None
+            best_challenging_improvement = float('-inf')
+            best_benign_improvement = float('-inf')
+            
+            alpha_improvements = {}
+            
+            for alpha, results_dict in results.items():
+                alpha_val = float(alpha)
+                if alpha_val == 0:  # Skip baseline
+                    continue
+                    
+                challenging_toxicity = results_dict['challenging']['mean_toxicity']
+                benign_toxicity = results_dict['benign']['mean_toxicity']
+                
+                # Calculate improvement percentages
+                challenging_improvement = ((baseline_challenging - challenging_toxicity) / baseline_challenging) * 100
+                benign_improvement = ((baseline_benign - benign_toxicity) / baseline_benign) * 100
+                
+                alpha_improvements[alpha_val] = {
+                    'challenging_improvement': challenging_improvement,
+                    'benign_improvement': benign_improvement,
+                    'challenging_toxicity': challenging_toxicity,
+                    'benign_toxicity': benign_toxicity
+                }
+                
+                # Track best overall improvement (prioritize challenging subset)
+                if challenging_improvement > best_challenging_improvement:
+                    best_challenging_improvement = challenging_improvement
+                    best_benign_improvement = benign_improvement
+                    best_alpha = alpha_val
+            
+            if not alpha_improvements:
+                print("Warning: No non-baseline results available for effectiveness summary")
+                return
+            
+            # Create summary plot with 3 panels
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+            fig.suptitle('Activation Steering Effectiveness Summary\nOverall Impact vs Baseline', fontsize=16, fontweight='bold')
+            
+            # Panel 1: Absolute Toxicity Comparison (Bar Chart)
+            ax1.set_title('Absolute Toxicity Scores\nBaseline vs Best Steering', fontweight='bold')
+            
+            categories = ['Challenging\nSubset', 'Benign\nSubset']
+            baseline_values = [baseline_challenging, baseline_benign]
+            best_steering_values = [
+                alpha_improvements[best_alpha]['challenging_toxicity'],
+                alpha_improvements[best_alpha]['benign_toxicity']
+            ]
+            
+            x = np.arange(len(categories))
+            width = 0.35
+            
+            bars1 = ax1.bar(x - width/2, baseline_values, width, label='Baseline (α=0)', 
+                           color='#ff7f7f', alpha=0.8, edgecolor='black', linewidth=1)
+            bars2 = ax1.bar(x + width/2, best_steering_values, width, label=f'Best Steering (α={best_alpha})', 
+                           color='#7fbf7f', alpha=0.8, edgecolor='black', linewidth=1)
+            
+            # Add value labels on bars
+            for i, (baseline, steered) in enumerate(zip(baseline_values, best_steering_values)):
+                ax1.text(i - width/2, baseline + 0.01, f'{baseline:.3f}', 
+                        ha='center', va='bottom', fontweight='bold')
+                ax1.text(i + width/2, steered + 0.01, f'{steered:.3f}', 
+                        ha='center', va='bottom', fontweight='bold')
+            
+            ax1.set_ylabel('Mean Toxicity Score')
+            ax1.set_xlabel('Prompt Type')
+            ax1.set_xticks(x)
+            ax1.set_xticklabels(categories)
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            ax1.set_ylim(0, max(max(baseline_values), max(best_steering_values)) * 1.2)
+            
+            # Panel 2: Improvement Percentages (Bar Chart)
+            ax2.set_title('Steering Effectiveness\nImprovement from Baseline', fontweight='bold')
+            
+            improvements = [
+                alpha_improvements[best_alpha]['challenging_improvement'],
+                alpha_improvements[best_alpha]['benign_improvement']
+            ]
+            
+            colors = ['#ff6b6b' if imp < 0 else '#4ecdc4' for imp in improvements]
+            bars = ax2.bar(categories, improvements, color=colors, alpha=0.8, 
+                          edgecolor='black', linewidth=1)
+            
+            # Add value labels
+            for bar, improvement in zip(bars, improvements):
+                height = bar.get_height()
+                ax2.text(bar.get_x() + bar.get_width()/2., height + (1 if height >= 0 else -3),
+                        f'{improvement:+.1f}%', ha='center', 
+                        va='bottom' if height >= 0 else 'top', fontweight='bold')
+            
+            ax2.axhline(y=0, color='black', linestyle='-', alpha=0.5)
+            ax2.set_ylabel('Improvement (%)')
+            ax2.set_xlabel('Prompt Type')
+            ax2.grid(True, alpha=0.3)
+            
+            # Panel 3: Alpha Sweep Comparison
+            ax3.set_title('Steering Strength Comparison\nAll Alpha Values', fontweight='bold')
+            
+            alphas = sorted([float(a) for a in alpha_improvements.keys()])
+            challenging_improvements = [alpha_improvements[a]['challenging_improvement'] for a in alphas]
+            benign_improvements = [alpha_improvements[a]['benign_improvement'] for a in alphas]
+            
+            ax3.plot(alphas, challenging_improvements, 'o-', color='#ff6b6b', linewidth=2, 
+                    markersize=8, label='Challenging Subset')
+            ax3.plot(alphas, benign_improvements, 's-', color='#4ecdc4', linewidth=2, 
+                    markersize=8, label='Benign Subset')
+            
+            # Highlight best alpha
+            best_idx = alphas.index(best_alpha)
+            ax3.plot(best_alpha, challenging_improvements[best_idx], 'o', 
+                    color='darkred', markersize=12, markerfacecolor='yellow', 
+                    markeredgewidth=2, label=f'Best α={best_alpha}')
+            
+            ax3.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+            ax3.set_xlabel('Alpha Value (Steering Strength)')
+            ax3.set_ylabel('Improvement from Baseline (%)')
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+            
+            # Panel 4: Summary Statistics Table
+            ax4.set_title('Summary Statistics', fontweight='bold')
+            ax4.axis('off')
+            
+            # Calculate additional metrics
+            max_challenging_improvement = max(challenging_improvements) if challenging_improvements else 0
+            max_benign_improvement = max(benign_improvements) if benign_improvements else 0
+            avg_challenging_improvement = np.mean(challenging_improvements) if challenging_improvements else 0
+            avg_benign_improvement = np.mean(benign_improvements) if benign_improvements else 0
+            
+            # Create summary table
+            summary_data = [
+                ['Metric', 'Challenging', 'Benign'],
+                ['Baseline Toxicity', f'{baseline_challenging:.3f}', f'{baseline_benign:.3f}'],
+                ['Best Steered Toxicity', f'{alpha_improvements[best_alpha]["challenging_toxicity"]:.3f}', 
+                 f'{alpha_improvements[best_alpha]["benign_toxicity"]:.3f}'],
+                ['Best Improvement', f'{max_challenging_improvement:+.1f}%', f'{max_benign_improvement:+.1f}%'],
+                ['Average Improvement', f'{avg_challenging_improvement:+.1f}%', f'{avg_benign_improvement:+.1f}%'],
+                ['Optimal Alpha', f'{best_alpha}', f'{best_alpha}'],
+                ['Baseline Context', 'High prompt toxicity → Low completion toxicity', 
+                 'Low prompt toxicity → High completion toxicity']
+            ]
+            
+            table = ax4.table(cellText=summary_data[1:], colLabels=summary_data[0],
+                             cellLoc='center', loc='center')
+            table.auto_set_font_size(False)
+            table.set_fontsize(10)
+            table.scale(1.2, 2.5)
+            
+            # Style the table
+            for (i, j), cell in table.get_celld().items():
+                if i == 0:  # Header row
+                    cell.set_text_props(weight='bold')
+                    cell.set_facecolor('#ff7f50')
+                elif i == 3:  # Best improvement row - highlight
+                    cell.set_facecolor('#90EE90' if j == 0 else '#ffeb9c')
+                else:
+                    cell.set_facecolor('#f1f1f2' if i % 2 == 0 else '#ffffff')
+            
+            plt.tight_layout()
+            
+            # Save summary plot
+            plt.savefig(f"{save_dir}/steering_effectiveness_summary.png", dpi=300, bbox_inches='tight')
+            plt.savefig(f"{save_dir}/steering_effectiveness_summary.pdf", bbox_inches='tight')
+            plt.close('all')
+            
+            print(f"Steering effectiveness summary saved to {save_dir}/steering_effectiveness_summary.png and .pdf")
+            
+            # Print key insights to console
+            print(f"\n=== Steering Effectiveness Summary ===")
+            print(f"Best steering configuration: α = {best_alpha}")
+            print(f"Challenging subset improvement: {max_challenging_improvement:+.1f}% (baseline: {baseline_challenging:.3f} → steered: {alpha_improvements[best_alpha]['challenging_toxicity']:.3f})")
+            print(f"Benign subset improvement: {max_benign_improvement:+.1f}% (baseline: {baseline_benign:.3f} → steered: {alpha_improvements[best_alpha]['benign_toxicity']:.3f})")
+            
+            if max_challenging_improvement > 10:
+                print("✓ Strong steering effectiveness on challenging prompts")
+            elif max_challenging_improvement > 0:
+                print("⚠ Moderate steering effectiveness on challenging prompts")  
+            else:
+                print("⚠ Negative steering effect on challenging prompts")
+                
+        except Exception as e:
+            print(f"Error generating steering effectiveness summary: {e}")
             try:
                 plt.close('all')
             except:
