@@ -39,9 +39,9 @@ random.seed(RANDOM_SEED)
 @dataclass
 class GenerationConfig:
     """Configuration for text generation"""
-    temperature: float = 0.7
-    top_p: float = 0.9
-    max_new_tokens: int = 256  # Using upper bound of 128-256 range
+    temperature: float = 0.3  # More deterministic for clearer steering effects
+    top_p: float = 0.8       # More focused sampling to reduce noise
+    max_new_tokens: int = 128  # Using lower bound of 128-256 range
     do_sample: bool = True
     pad_token_id: int = None
     eos_token_id: int = None
@@ -116,7 +116,8 @@ class ActivationSteeringExperiment:
         self.toxicity_classifier = pipeline(
             "text-classification",
             model="unitary/unbiased-toxic-roberta",
-            device=pipeline_device
+            device=pipeline_device,
+            top_k=None  # Return all scores (replaces deprecated return_all_scores=True)
         )
         
         # Configuration
@@ -313,20 +314,14 @@ class ActivationSteeringExperiment:
         batch_size = 16
         for i in tqdm(range(0, len(texts), batch_size), desc="Scoring toxicity"):
             batch = texts[i:i+batch_size]
-            batch_scores = self.toxicity_classifier(batch)
+            batch_results = self.toxicity_classifier(batch)
             
-            for score_result in batch_scores:
-                # Get toxicity score (1.0 - TOXIC label probability)
-                if isinstance(score_result, list):
-                    # Handle case where multiple labels are returned
-                    toxic_score = next(
-                        (item['score'] for item in score_result if item['label'] == 'TOXIC'), 
-                        0.0
-                    )
-                else:
-                    # Handle single result
-                    toxic_score = score_result['score'] if score_result['label'] == 'TOXIC' else 1.0 - score_result['score']
-                
+            for result in batch_results:
+                # With top_k=None, result is always a list of all label probabilities
+                toxic_score = next(
+                    (item['score'] for item in result if item['label'] == 'toxicity'), 
+                    0.0
+                )
                 scores.append(toxic_score)
         
         return scores
@@ -438,7 +433,13 @@ class ActivationSteeringExperiment:
         return outputs
     
     def run_baseline_evaluation(self) -> Dict[str, Any]:
-        """Run baseline evaluation without steering"""
+        """
+        DEPRECATED: Run baseline evaluation without steering
+        
+        This function is deprecated. Use run_baseline_evaluation_with_activations() instead
+        for better performance (combines baseline evaluation and activation collection).
+        """
+        print("WARNING: run_baseline_evaluation() is deprecated. Use run_baseline_evaluation_with_activations() for better performance.")
         print("Running baseline evaluation...")
         
         if self.challenging_subset is None or self.benign_subset is None:
@@ -507,7 +508,13 @@ class ActivationSteeringExperiment:
         return results
     
     def collect_activations(self) -> None:
-        """Collect activations from all layers during baseline generation"""
+        """
+        DEPRECATED: Collect activations from all layers during baseline generation
+        
+        This function is deprecated. Use run_baseline_evaluation_with_activations() instead
+        for better performance (combines baseline evaluation and activation collection in one pass).
+        """
+        print("WARNING: collect_activations() is deprecated. Use run_baseline_evaluation_with_activations() for better performance.")
         if self.baseline_results is None:
             raise ValueError("Baseline results not available. Run run_baseline_evaluation() first.")
         
@@ -662,6 +669,202 @@ class ActivationSteeringExperiment:
             }
         })
     
+    def run_baseline_evaluation_with_activations(self) -> Dict[str, Any]:
+        """Run baseline evaluation while collecting activations in one pass for efficiency"""
+        print("Running combined baseline evaluation and activation collection...")
+        
+        if self.challenging_subset is None or self.benign_subset is None:
+            raise ValueError("Subsets not created. Call create_subsets() first.")
+        
+        # Get all transformer layers
+        num_layers = len(self.transformer_layers)
+        print(f"Model has {num_layers} transformer layers")
+        print("Collecting baseline results and activations simultaneously for efficiency")
+        
+        # Storage for activations
+        layer_activations = {i: [] for i in range(num_layers)}
+        current_activations = {}
+        
+        def make_hook(layer_idx):
+            def hook_fn(module, input, output):
+                # Store the activation (residual stream output)
+                # Handle different output formats from different model architectures
+                if isinstance(output, tuple):
+                    activation = output[0].detach().cpu()
+                else:
+                    activation = output.detach().cpu()
+                
+                current_activations[layer_idx] = activation
+            return hook_fn
+        
+        # Register hooks for all layers
+        hooks = []
+        for i, layer in enumerate(self.transformer_layers):
+            hook = layer.register_forward_hook(make_hook(i))
+            hooks.append(hook)
+        
+        try:
+            # Prepare prompts
+            challenging_prompts = [item['prompt']['text'] for item in self.challenging_subset]
+            benign_prompts = [item['prompt']['text'] for item in self.benign_subset]
+            all_prompts = challenging_prompts + benign_prompts
+            all_labels = ['challenging'] * len(challenging_prompts) + ['benign'] * len(benign_prompts)
+            
+            all_completions = []
+            
+            # Single pass: generate completions AND collect activations
+            for prompt, label in tqdm(zip(all_prompts, all_labels), 
+                                    desc="Baseline + Activations", 
+                                    total=len(all_prompts)):
+                # Clear current activations
+                current_activations.clear()
+                
+                # Tokenize input
+                inputs = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                
+                # Generate completion (activations collected via hooks)
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        inputs['input_ids'],
+                        attention_mask=inputs['attention_mask'],
+                        temperature=self.gen_config.temperature,
+                        top_p=self.gen_config.top_p,
+                        max_new_tokens=self.gen_config.max_new_tokens,
+                        do_sample=self.gen_config.do_sample,
+                        pad_token_id=self.gen_config.pad_token_id,
+                        eos_token_id=self.gen_config.eos_token_id
+                    )
+                
+                # Decode completion (remove input prompt)
+                input_length = inputs['input_ids'].shape[1]
+                completion = self.tokenizer.decode(
+                    outputs[0][input_length:], 
+                    skip_special_tokens=True
+                ).strip()
+                
+                all_completions.append(completion)
+                
+                # Store activations for each layer with metadata
+                for layer_idx in current_activations:
+                    activation = current_activations[layer_idx]
+                    
+                    # Handle different activation tensor shapes
+                    if activation.dim() == 2:
+                        # Shape: [seq_len, hidden_dim] - need to add batch dimension
+                        activation = activation.unsqueeze(0)  # [1, seq_len, hidden_dim]
+                    elif activation.dim() == 1:
+                        # Shape: [hidden_dim] - already pooled, just use as is
+                        pooled_activation = activation
+                        layer_activations[layer_idx].append({
+                            'activation': pooled_activation,  # [hidden_dim]
+                            'completion': completion,
+                            'prompt_type': label,
+                            'prompt': prompt
+                        })
+                        continue
+                    elif activation.dim() != 3:
+                        print(f"Warning: Unexpected activation shape at layer {layer_idx}: {activation.shape}")
+                        # Skip this layer if we can't handle the shape
+                        continue
+                    
+                    # Now we should have [batch_size, seq_len, hidden_dim]
+                    if activation.dim() == 3:
+                        seq_len = activation.shape[1]
+                        pool_tokens = min(self.steering_config.mean_pool_tokens, seq_len)
+                        
+                        # Take the last pool_tokens and mean pool
+                        pooled_activation = activation[:, -pool_tokens:, :].mean(dim=1)  # [batch_size, hidden_dim]
+                        pooled_activation = pooled_activation.squeeze(0)  # [hidden_dim]
+                    else:
+                        # Fallback: just use the activation as is
+                        pooled_activation = activation.flatten()
+                    
+                    layer_activations[layer_idx].append({
+                        'activation': pooled_activation,  # [hidden_dim]
+                        'completion': completion,
+                        'prompt_type': label,
+                        'prompt': prompt
+                    })
+            
+        finally:
+            # Remove all hooks
+            for hook in hooks:
+                hook.remove()
+        
+        # Score all completions at once (more efficient)
+        print("Scoring toxicity for all completions...")
+        all_toxicity_scores = self.score_toxicity(all_completions)
+        
+        # Split results back into challenging/benign
+        challenging_completions = all_completions[:len(challenging_prompts)]
+        challenging_scores = all_toxicity_scores[:len(challenging_prompts)]
+        benign_completions = all_completions[len(challenging_prompts):]
+        benign_scores = all_toxicity_scores[len(challenging_prompts):]
+        
+        # Create baseline results
+        baseline_results = {
+            'challenging': {
+                'prompts': challenging_prompts,
+                'completions': challenging_completions,
+                'toxicity_scores': challenging_scores,
+                'mean_toxicity': np.mean(challenging_scores)
+            },
+            'benign': {
+                'prompts': benign_prompts,
+                'completions': benign_completions,
+                'toxicity_scores': benign_scores,
+                'mean_toxicity': np.mean(benign_scores)
+            }
+        }
+        
+        # Store results in instance variables
+        self.baseline_results = baseline_results
+        self.activations = layer_activations
+        
+        print(f"Combined Results:")
+        print(f"  Challenging subset mean toxicity: {baseline_results['challenging']['mean_toxicity']:.3f}")
+        print(f"  Benign subset mean toxicity: {baseline_results['benign']['mean_toxicity']:.3f}")
+        print(f"  Collected activations for {len(all_completions)} completions across {num_layers} layers")
+        
+        # Clear device cache after intensive operation
+        self._clear_device_cache()
+        
+        # Save intermediate output: combined results
+        self._save_intermediate_output({
+            'step': 'baseline_evaluation_with_activations',
+            'timestamp': self._get_timestamp(),
+            'baseline_results': {
+                'challenging_mean_toxicity': baseline_results['challenging']['mean_toxicity'],
+                'benign_mean_toxicity': baseline_results['benign']['mean_toxicity'],
+                'challenging_prompt_completion_pairs': [
+                    {'prompt': prompt, 'completion': completion, 'toxicity_score': score}
+                    for prompt, completion, score in zip(
+                        baseline_results['challenging']['prompts'],
+                        baseline_results['challenging']['completions'], 
+                        baseline_results['challenging']['toxicity_scores']
+                    )
+                ],
+                'benign_prompt_completion_pairs': [
+                    {'prompt': prompt, 'completion': completion, 'toxicity_score': score}
+                    for prompt, completion, score in zip(
+                        baseline_results['benign']['prompts'],
+                        baseline_results['benign']['completions'], 
+                        baseline_results['benign']['toxicity_scores']
+                    )
+                ]
+            },
+            'activation_collection': {
+                'num_layers': num_layers,
+                'total_completions': len(all_completions),
+                'challenging_prompts': len(challenging_prompts),
+                'benign_prompts': len(benign_prompts),
+                'mean_pool_tokens': self.steering_config.mean_pool_tokens
+            }
+        })
+        
+        return baseline_results
+    
     def compute_steering_vectors(self) -> Dict[int, torch.Tensor]:
         """Compute steering vectors for each layer using CAA"""
         if not self.activations:
@@ -788,7 +991,13 @@ class ActivationSteeringExperiment:
             print(f"Warning: Failed to save intermediate output: {e}")
     
     def run_steering_evaluation(self, target_layer: int = None) -> Dict[str, Any]:
-        """Run full steering evaluation across all alpha values"""
+        """
+        DEPRECATED: Run full steering evaluation across all alpha values
+        
+        This function is deprecated. Use run_comprehensive_steering_evaluation() instead
+        for better performance (combines single-layer and all-layer analysis).
+        """
+        print("WARNING: run_steering_evaluation() is deprecated. Use run_comprehensive_steering_evaluation() for better performance.")
         if not self.steering_vectors:
             raise ValueError("Steering vectors not computed. Run compute_steering_vectors() first.")
         
@@ -883,9 +1092,12 @@ class ActivationSteeringExperiment:
     
     def evaluate_steering_all_layers(self, challenging_subset_size: int = None, benign_subset_size: int = None) -> Dict[str, Any]:
         """
-        Evaluate steering effectiveness across all layers for comprehensive analysis.
-        This provides layer-wise effectiveness data for visualization.
+        DEPRECATED: Evaluate steering effectiveness across all layers for comprehensive analysis.
+        
+        This function is deprecated. Use run_comprehensive_steering_evaluation() instead
+        for better performance (avoids redundant computation with single-layer evaluation).
         """
+        print("WARNING: evaluate_steering_all_layers() is deprecated. Use run_comprehensive_steering_evaluation() for better performance.")
         if not self.steering_vectors:
             raise ValueError("Steering vectors not computed. Run compute_steering_vectors() first.")
         
@@ -962,6 +1174,227 @@ class ActivationSteeringExperiment:
             'num_prompts': {
                 'challenging': len(challenging_prompts),
                 'benign': len(benign_prompts)
+            }
+        }
+    
+    def run_comprehensive_steering_evaluation(self, target_layer: int = None, 
+                                            full_subset_for_target: bool = True,
+                                            layer_subset_size: int = 8) -> Dict[str, Any]:
+        """
+        Run comprehensive steering evaluation combining single-layer analysis and all-layer analysis.
+        More efficient than running run_steering_evaluation() and evaluate_steering_all_layers() separately.
+        
+        Args:
+            target_layer: Primary layer for detailed analysis (default: middle layer)
+            full_subset_for_target: Use full dataset for target layer (50 prompts), smaller for others
+            layer_subset_size: Number of prompts to use for non-target layers (for efficiency)
+        """
+        if not self.steering_vectors:
+            raise ValueError("Steering vectors not computed. Run compute_steering_vectors() first.")
+        
+        print("=== Running Comprehensive Steering Evaluation ===")
+        
+        # Select target layer (use middle layer if not specified)
+        if target_layer is None:
+            target_layer = len(self.steering_vectors) // 2
+            print(f"Using layer {target_layer} as primary target layer (middle layer)")
+        else:
+            print(f"Using layer {target_layer} as primary target layer")
+        
+        if target_layer not in self.steering_vectors:
+            raise ValueError(f"No steering vector available for layer {target_layer}")
+        
+        # Prepare prompt sets
+        challenging_prompts_full = [item['prompt']['text'] for item in self.challenging_subset]
+        benign_prompts_full = [item['prompt']['text'] for item in self.benign_subset]
+        
+        # Smaller subset for layer analysis efficiency
+        challenging_prompts_small = challenging_prompts_full[:layer_subset_size]
+        benign_prompts_small = benign_prompts_full[:layer_subset_size]
+        
+        print(f"Target layer will use full dataset ({len(challenging_prompts_full)} + {len(benign_prompts_full)} prompts)")
+        print(f"Other layers will use reduced dataset ({len(challenging_prompts_small)} + {len(benign_prompts_small)} prompts)")
+        
+        # Results storage
+        target_layer_results = {}  # Detailed results for target layer
+        all_layers_results = {}    # Results for all layers (smaller dataset)
+        
+        # Test all alpha values
+        alpha_values = self.steering_config.alpha_values
+        test_alphas_no_baseline = [alpha for alpha in alpha_values if alpha != 0]  # Exclude baseline for layer analysis
+        
+        print(f"Testing alpha values: {alpha_values} (target layer), {test_alphas_no_baseline} (all layers)")
+        
+        # Step 1: Evaluate target layer with full dataset and all alpha values
+        print(f"\n--- Evaluating Target Layer {target_layer} (Full Dataset) ---")
+        for alpha in tqdm(alpha_values, desc=f"Target layer {target_layer}"):
+            print(f"Evaluating target layer {target_layer} with alpha = {alpha}")
+            
+            if alpha == 0.0:
+                # Use baseline results for alpha = 0
+                if self.baseline_results:
+                    target_layer_results[alpha] = {
+                        'challenging': self.baseline_results['challenging'],
+                        'benign': self.baseline_results['benign']
+                    }
+                    print(f"  Using cached baseline results for alpha = {alpha}")
+                    continue
+            
+            # Generate completions with steering
+            challenging_completions = self.generate_completions(
+                challenging_prompts_full, alpha=alpha, layer=target_layer
+            )
+            benign_completions = self.generate_completions(
+                benign_prompts_full, alpha=alpha, layer=target_layer
+            )
+            
+            # Score completions
+            challenging_scores = self.score_toxicity(challenging_completions)
+            benign_scores = self.score_toxicity(benign_completions)
+            
+            # Store results
+            target_layer_results[alpha] = {
+                'challenging': {
+                    'completions': challenging_completions,
+                    'toxicity_scores': challenging_scores,
+                    'mean_toxicity': np.mean(challenging_scores)
+                },
+                'benign': {
+                    'completions': benign_completions,
+                    'toxicity_scores': benign_scores,
+                    'mean_toxicity': np.mean(benign_scores)
+                }
+            }
+            
+            print(f"  Challenging mean toxicity: {target_layer_results[alpha]['challenging']['mean_toxicity']:.3f}")
+            print(f"  Benign mean toxicity: {target_layer_results[alpha]['benign']['mean_toxicity']:.3f}")
+        
+        # Step 2: Evaluate all other layers with reduced dataset
+        print(f"\n--- Evaluating All {len(self.steering_vectors)} Layers (Reduced Dataset) ---")
+        
+        for layer_idx in tqdm(sorted(self.steering_vectors.keys()), desc="All layers evaluation"):
+            all_layers_results[layer_idx] = {}
+            
+            # For target layer, reuse results from Step 1 (but adapt to smaller dataset if needed)
+            if layer_idx == target_layer:
+                print(f"  Reusing target layer {layer_idx} results...")
+                for alpha in test_alphas_no_baseline:
+                    if alpha in target_layer_results:
+                        # Use subset of the full results to match other layers
+                        full_result = target_layer_results[alpha]
+                        all_layers_results[layer_idx][alpha] = {
+                            'challenging': {
+                                'completions': full_result['challenging']['completions'][:layer_subset_size],
+                                'toxicity_scores': full_result['challenging']['toxicity_scores'][:layer_subset_size],
+                                'mean_toxicity': np.mean(full_result['challenging']['toxicity_scores'][:layer_subset_size])
+                            },
+                            'benign': {
+                                'completions': full_result['benign']['completions'][:layer_subset_size],
+                                'toxicity_scores': full_result['benign']['toxicity_scores'][:layer_subset_size],
+                                'mean_toxicity': np.mean(full_result['benign']['toxicity_scores'][:layer_subset_size])
+                            }
+                        }
+                continue
+            
+            # For other layers, run with reduced dataset
+            for alpha in test_alphas_no_baseline:
+                # Generate completions with steering at this specific layer
+                challenging_completions = self.generate_completions(
+                    challenging_prompts_small, alpha=alpha, layer=layer_idx
+                )
+                benign_completions = self.generate_completions(
+                    benign_prompts_small, alpha=alpha, layer=layer_idx
+                )
+                
+                # Score the completions
+                challenging_scores = self.score_toxicity(challenging_completions)
+                benign_scores = self.score_toxicity(benign_completions)
+                
+                # Store results for this layer and alpha
+                all_layers_results[layer_idx][alpha] = {
+                    'challenging': {
+                        'completions': challenging_completions,
+                        'toxicity_scores': challenging_scores,
+                        'mean_toxicity': np.mean(challenging_scores) if challenging_scores else 0
+                    },
+                    'benign': {
+                        'completions': benign_completions,
+                        'toxicity_scores': benign_scores,
+                        'mean_toxicity': np.mean(benign_scores) if benign_scores else 0
+                    }
+                }
+        
+        # Calculate layer effectiveness metrics
+        layer_effectiveness = {}
+        for layer_idx in all_layers_results:
+            effectiveness_scores = []
+            for alpha in test_alphas_no_baseline:
+                if alpha in all_layers_results[layer_idx]:
+                    challenging_toxicity = all_layers_results[layer_idx][alpha]['challenging']['mean_toxicity']
+                    # Lower toxicity = higher effectiveness, so we invert
+                    effectiveness_scores.append(1.0 - challenging_toxicity)
+            
+            layer_effectiveness[layer_idx] = {
+                'mean_effectiveness': np.mean(effectiveness_scores) if effectiveness_scores else 0,
+                'max_effectiveness': np.max(effectiveness_scores) if effectiveness_scores else 0,
+                'effectiveness_scores': effectiveness_scores
+            }
+        
+        # Print summary
+        print("\n=== Comprehensive Steering Summary ===")
+        print("Target Layer Results (Full Dataset):")
+        print("Alpha\tChallenging\tBenign")
+        for alpha in alpha_values:
+            if alpha in target_layer_results:
+                challenging_mean = target_layer_results[alpha]['challenging']['mean_toxicity']
+                benign_mean = target_layer_results[alpha]['benign']['mean_toxicity']
+                print(f"{alpha:6.2f}\t{challenging_mean:.3f}\t\t{benign_mean:.3f}")
+        
+        # Find most/least effective layers
+        if layer_effectiveness:
+            most_effective_layer = max(layer_effectiveness.keys(), key=lambda l: layer_effectiveness[l]['mean_effectiveness'])
+            least_effective_layer = min(layer_effectiveness.keys(), key=lambda l: layer_effectiveness[l]['mean_effectiveness'])
+            print(f"\nLayer Analysis Summary:")
+            print(f"  Most effective layer: {most_effective_layer} ({layer_effectiveness[most_effective_layer]['mean_effectiveness']*100:.1f}% effectiveness)")
+            print(f"  Least effective layer: {least_effective_layer} ({layer_effectiveness[least_effective_layer]['mean_effectiveness']*100:.1f}% effectiveness)")
+        
+        # Save comprehensive intermediate output
+        self._save_intermediate_output({
+            'step': 'comprehensive_steering_evaluation',
+            'timestamp': self._get_timestamp(),
+            'target_layer_results': {
+                'layer': target_layer,
+                'full_dataset_size': {'challenging': len(challenging_prompts_full), 'benign': len(benign_prompts_full)},
+                'results': {
+                    str(alpha): {
+                        'challenging_mean_toxicity': target_layer_results[alpha]['challenging']['mean_toxicity'],
+                        'benign_mean_toxicity': target_layer_results[alpha]['benign']['mean_toxicity']
+                    } for alpha in target_layer_results
+                }
+            },
+            'layer_analysis_summary': {
+                'num_layers_tested': len(all_layers_results),
+                'reduced_dataset_size': {'challenging': len(challenging_prompts_small), 'benign': len(benign_prompts_small)},
+                'most_effective_layer': most_effective_layer if layer_effectiveness else None,
+                'least_effective_layer': least_effective_layer if layer_effectiveness else None
+            }
+        })
+        
+        return {
+            'target_layer_results': {
+                'results': target_layer_results,
+                'target_layer': target_layer,
+                'baseline_challenging': self.baseline_results['challenging']['mean_toxicity'] if self.baseline_results else None,
+                'baseline_benign': self.baseline_results['benign']['mean_toxicity'] if self.baseline_results else None
+            },
+            'layer_analysis_results': {
+                'layer_results': all_layers_results,
+                'layer_effectiveness': layer_effectiveness,
+                'test_alphas': test_alphas_no_baseline,
+                'num_prompts': {
+                    'challenging': len(challenging_prompts_small),
+                    'benign': len(benign_prompts_small)
+                }
             }
         }
     
@@ -1593,6 +2026,15 @@ class ActivationSteeringExperiment:
             except:
                 pass
 
+def main_lightweight():
+    print("=== Lightweight Activation Steering Experiment for Toxicity Reduction ===")
+    experiment = ActivationSteeringExperiment()
+
+    # Step 1: Load dataset and create subsets
+    experiment.load_rtp_dataset()
+    experiment.create_subsets()
+
+
 def main():
     """Main execution function"""
     print("=== Activation Steering Experiment for Toxicity Reduction ===")
@@ -1606,30 +2048,24 @@ def main():
         experiment.load_rtp_dataset()
         experiment.create_subsets()
         
-        # Step 2: Run baseline evaluation
-        print("\n--- Step 2: Baseline Evaluation ---")
-        baseline_results = experiment.run_baseline_evaluation()
+        # Step 2: Run baseline evaluation with activation collection (combined for efficiency)
+        print("\n--- Step 2: Baseline Evaluation + Activation Collection ---")
+        baseline_results = experiment.run_baseline_evaluation_with_activations()
         
-        # Step 3: Collect activations
-        print("\n--- Step 3: Collecting Activations ---")
-        experiment.collect_activations()
-        
-        # Step 4: Compute steering vectors
-        print("\n--- Step 4: Computing Steering Vectors ---")
+        # Step 3: Compute steering vectors
+        print("\n--- Step 3: Computing Steering Vectors ---")
         experiment.compute_steering_vectors()
         
-        # Step 5: Run steering evaluation
-        print("\n--- Step 5: Steering Evaluation ---")
-        steering_results = experiment.run_steering_evaluation()
-        
-        # Layer-wise Steering Analysis (now part of standard experiment)
-        print("\n--- Step 6: Layer-wise Steering Analysis ---")
-        print("Evaluating steering effectiveness across all transformer layers...")
-        print("This step analyzes which layers are most effective for toxicity steering.")
-        layer_analysis_results = experiment.evaluate_steering_all_layers(
-            challenging_subset_size=8,  # Use smaller subset for efficiency in integrated analysis
-            benign_subset_size=8
+        # Step 4: Comprehensive steering evaluation (combines single-layer and all-layer analysis)
+        print("\n--- Step 4: Comprehensive Steering Evaluation ---")
+        print("Running combined target layer analysis and all-layer comparison for efficiency...")
+        comprehensive_results = experiment.run_comprehensive_steering_evaluation(
+            layer_subset_size=8  # Use smaller subset for non-target layers
         )
+        
+        # Extract results for backward compatibility with plotting functions
+        steering_results = comprehensive_results['target_layer_results']
+        layer_analysis_results = comprehensive_results['layer_analysis_results']
         
         # Save all results including layer analysis
         print("\n--- Saving Results ---")
