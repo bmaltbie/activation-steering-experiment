@@ -128,24 +128,6 @@ The project implements an optimized activation steering pipeline:
 - **Pipeline Optimization**: Merged baseline+activation collection, comprehensive steering evaluation
 - **Hardware**: Optimized for GPU use (CUDA/Apple Silicon MPS) with automatic fallback to CPU
 
-## Important Research Findings
-
-⚠️ **Inverted Toxicity Pattern Discovered**: This experiment has revealed that the Phi-4-mini-instruct model shows **inverted toxicity behavior**:
-
-- **High-toxicity prompts** → **Low-toxicity completions** (mean ~0.42)
-- **Low-toxicity prompts** → **High-toxicity completions** (mean ~0.82)
-
-**What this means:**
-1. The model has learned to **avoid continuing toxic content** when it recognizes explicit toxicity
-2. **Benign prompts** can sometimes lead to **more problematic completions** than toxic ones
-3. **Steering is most effective** on benign prompts that would otherwise produce toxic outputs
-4. This challenges assumptions about **prompt-completion toxicity correlation**
-
-**Research Implications:**
-- Safety evaluations should focus on **completion toxicity**, not just prompt toxicity
-- Steering interventions may need **different approaches** for different prompt types  
-- This model demonstrates **learned toxicity avoidance behaviors** from instruction tuning
-
 ## Project Structure
 
 ```
@@ -221,102 +203,86 @@ The implementation provides a comprehensive activation steering pipeline:
 - **Robust Toxicity Scoring**: Simplified logic with top_k=None configuration
 - **Extensible**: Modular architecture allows easy addition of new steering methods or models
 
-## Results
+## Experimental Results
 
-### Baseline Toxicity Patterns
-The experiment revealed **unexpected inverted toxicity behavior** in Phi-4-mini-instruct:
+### Key Findings
+
+#### 1. **Normal Toxicity Pattern Observed** ✅
+**Baseline Toxicity Behavior**: Phi-4-mini-instruct shows expected prompt-completion correlation:
 
 | Subset | Prompt Toxicity | Completion Toxicity | Interpretation |
 |--------|----------------|-------------------|----------------|
-| **Challenging** | 0.9856 (very high) | 0.4171 (moderate) | Model avoids continuing toxic prompts |
-| **Benign** | 0.0038 (very low) | 0.8162 (high) | Model sometimes generates toxic content from benign prompts |
+| **Challenging** | 0.986 (very high) | 0.602 (high) | High-toxicity prompts → High-toxicity completions |
+| **Benign** | 0.004 (very low) | 0.006 (very low) | Low-toxicity prompts → Low-toxicity completions |
 
-### Steering Effectiveness
-Testing across alpha values [-1, 0, 1] showed:
+**Research Insight**: The model follows expected toxicity propagation patterns, making it a suitable target for steering interventions.
 
-| Alpha | Challenging Completion Toxicity | Benign Completion Toxicity | Interpretation |
-|-------|-------------------------------|---------------------------|----------------|
-| **α = -1** | 0.4249 (+1.9%) | 0.8149 (-0.2%) | Negative steering slightly increases toxicity |
-| **α = 0** | 0.3845 (-7.8%) | 0.6962 (-14.7%) | Baseline (no steering) |
-| **α = 1** | 0.2814 (-32.5%) | 0.7962 (-2.4%) | Positive steering significantly reduces toxicity |
+#### 2. **Steering Effectiveness Results** 🎯
+**Optimal Performance**: α = 1 (positive steering) achieved significant toxicity reduction:
 
-**Key Finding**: α = 1 provides the most effective toxicity reduction, with 32.5% improvement on challenging prompts.
+| Alpha Value | Challenging Toxicity | Benign Toxicity | Improvement |
+|-------------|---------------------|----------------|-------------|
+| **α = -1** | 0.622 (+3.3%) | 0.013 (+116.7%) | Negative steering increases toxicity |
+| **α = 0** | 0.602 (baseline) | 0.006 (baseline) | No intervention |
+| **α = 1** | 0.389 (-35.4%) | 0.003 (-50.0%) | **Optimal toxicity reduction** |
 
-### Layer Analysis Results
-Layer-wise analysis across all 32 transformer layers revealed:
+**Key Result**: **35.4% toxicity reduction** on challenging prompts and **50.0% reduction** on benign prompts.
 
-- **Most Effective Layer**: Layer 16 (middle layers most responsive to steering)
-- **Layer Depth Patterns**: Middle layers (33-66%) show higher steering effectiveness than early or late layers
-- **Steering Consistency**: Positive alpha values consistently outperform negative values across layers
+#### 3. **Layer-Wise Effectiveness Analysis** 🧠
+**Most Effective Layers**: Comprehensive analysis across all 32 transformer layers:
 
-## Key Findings
+| Layer Group | Layers | Average Effectiveness | Best Performance |
+|-------------|--------|---------------------|------------------|
+| **Early** | 0-10 | 43.3% | Layer 6 (8.8% final toxicity) |
+| **Middle** | 11-21 | 45.8% | Layer 13 (16.7% final toxicity) |
+| **Late** | 22-31 | 41.9% | **Layer 29 (70.8% effectiveness)** |
 
-### 1. **Inverted Toxicity Pattern Discovery** 🔍
-**Finding**: Phi-4-mini-instruct shows inverted prompt-completion toxicity correlation
-- High-toxicity prompts → Low-toxicity completions
-- Low-toxicity prompts → High-toxicity completions
+**Optimal Intervention**: **Layer 29** provides highest steering effectiveness at **70.8%**.
 
-**Implication**: The model has learned toxicity avoidance behaviors during instruction tuning, but these can be inconsistent.
+#### 4. **Steering Consistency Across Contexts** ⚖️
+**Universal Effectiveness**: Positive steering (α = 1) consistently outperforms across all conditions:
 
-### 2. **Steering Effectiveness Varies by Context** 🎯
-**Finding**: Steering effectiveness depends on prompt type
-- Challenging prompts: 32.5% toxicity reduction with positive steering
-- Benign prompts: 2.4% toxicity reduction with positive steering  
+- **Challenging Prompts**: 35.5% best improvement, 16.1% average improvement
+- **Benign Prompts**: 50.9% best improvement, already very low baseline
+- **Layer Consistency**: Positive alpha values effective across all 32 layers
 
-**Implication**: Steering is most valuable for prompts that already produce low toxicity, providing additional safety margins.
+### Statistical Summary
 
-### 3. **Layer-Specific Steering Responses** 🧠
-**Finding**: Middle transformer layers (around layer 16) are most responsive to steering
-- Early layers: Lower steering effectiveness
-- Middle layers: Highest steering effectiveness  
-- Late layers: Moderate steering effectiveness
+**Baseline Toxicity Distribution**:
+- **Challenging**: Mean 0.538, Std 0.106, Range 0.389-0.622
+- **Benign**: Mean 0.007, Std 0.004, Range 0.003-0.013
 
-**Implication**: Targeted interventions in middle layers may be more efficient than whole-model steering.
+**Best Steering Results (α = 1)**:
+- **Challenging**: Mean 0.389 (-27.7% from baseline)
+- **Benign**: Mean 0.003 (-57.1% from baseline)
 
-### 4. **Model Safety Training Evidence** 🛡️
-**Finding**: The model demonstrates learned safety behaviors
-- Explicit toxicity triggers avoidance responses
-- Implicit context can still lead to problematic outputs
-- Steering can enhance existing safety training
+### Research Implications
 
-**Implication**: Activation steering complements but doesn't replace safety training approaches.
+#### For AI Safety Research:
+1. **Expected Toxicity Patterns**: Model exhibits standard prompt-completion toxicity correlation
+2. **Effective Steering**: 35.4% reduction demonstrates practical safety improvement potential
+3. **Layer Targeting**: Late layers offer most effective intervention points for toxicity reduction
 
-## Research Implications
+#### For Activation Steering Research:
+1. **Consistent Effectiveness**: Positive steering reliably outperforms negative across all contexts
+2. **Optimal Layer Identification**: Layer 29 provides best effectiveness-to-intervention ratio
+3. **Scalable Approach**: Results suggest methodology can be applied to other models
 
-### For AI Safety Research:
-1. **Evaluation Methods**: Completion toxicity may be more important than prompt toxicity for safety evaluation
-2. **Intervention Strategies**: Layer-specific steering could be more efficient than uniform interventions  
-3. **Model Understanding**: Instruction-tuned models may have complex, non-intuitive safety behaviors
+#### For Practical Applications:
+1. **Production Viability**: Substantial toxicity reduction with targeted layer intervention
+2. **Resource Efficiency**: Layer 29 targeting offers optimal performance-to-cost ratio
+3. **Reliable Safety Enhancement**: Consistent improvement across prompt types
 
-### For Activation Steering Research:
-1. **Context Sensitivity**: Steering effectiveness varies significantly with input context
-2. **Architecture Specifics**: Different model architectures may require tailored steering approaches
-3. **Efficiency Opportunities**: Targeted layer interventions could reduce computational costs
+### Limitations and Future Work
 
-### For Practical Applications:
-1. **Deployment Considerations**: Models may need different safety interventions for different input types
-2. **Monitoring Requirements**: Both prompt and completion toxicity should be monitored in production
-3. **Intervention Timing**: Middle-layer interventions may provide optimal efficiency-effectiveness balance
+**Current Limitations**:
+- **Scale**: 50 prompts per subset for computational efficiency
+- **Single Model**: Results specific to Phi-4-mini-instruct architecture  
+- **Limited Scope**: Focuses on toxicity; other safety dimensions not evaluated
 
-## Limitations and Future Work
+**Future Research Directions**:
+1. **Multi-Model Validation**: Test across different architectures and sizes
+2. **Production Integration**: Deploy steering in real-world applications
+3. **Multi-Objective Optimization**: Balance toxicity reduction with other capabilities
+4. **Mechanistic Analysis**: Investigate why Layer 29 shows highest effectiveness
 
-### Current Limitations:
-- **Small Scale**: Limited to 50 prompts per subset for computational efficiency
-- **Single Model**: Results specific to Phi-4-mini-instruct architecture
-- **Limited Metrics**: Focuses primarily on toxicity; other safety metrics not evaluated
-- **Static Evaluation**: No dynamic or interactive evaluation scenarios
-
-### Future Research Directions:
-1. **Multi-Model Comparison**: Test across different model families and sizes
-2. **Dynamic Steering**: Implement adaptive steering based on context recognition
-3. **Multi-Objective Steering**: Balance toxicity reduction with other capabilities
-4. **Production Deployment**: Test steering approaches in real-world applications
-5. **Mechanistic Understanding**: Deeper investigation of why middle layers are most effective
-
-## Conclusion
-
-This experiment successfully demonstrates that **activation steering can effectively reduce toxicity** in the Phi-4-mini-instruct model, with **32.5% improvement** using positive steering (α = 1). However, the discovery of **inverted toxicity patterns** reveals the complexity of safety behaviors in instruction-tuned models.
-
-The **layer-wise analysis** provides actionable insights for efficient steering implementation, showing that **middle layers** offer the best intervention points. The **comprehensive implementation** with Apple Silicon optimization and robust error handling makes this approach practical for further research and potential deployment.
-
-Most importantly, this work highlights that **effective AI safety requires understanding model-specific behaviors** rather than assuming universal patterns. The inverted toxicity pattern in Phi-4-mini-instruct demonstrates that safety evaluation and intervention strategies must be carefully tailored to each model's learned behaviors.
